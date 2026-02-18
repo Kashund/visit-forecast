@@ -26,7 +26,9 @@ def _timeseries_to_pd(ts) -> pd.DataFrame:
         return ts.to_dataframe()
     if hasattr(ts, "pandas_dataframe"):
         return ts.pandas_dataframe()
-    raise AttributeError("Cannot convert TimeSeries to DataFrame for this Darts version.")
+    raise AttributeError(
+        "Cannot convert TimeSeries to DataFrame for this Darts version."
+    )
 
 
 def _score_label(metric_name: str, value: float, baseline: float | None = None):
@@ -87,10 +89,7 @@ common = dict(
     forecast_periods=controls["forecast_periods"],
     department=controls["department"],
     exclude_departments=controls["exclude_departments"] or None,
-    adjustment_mode=controls["adjustment_mode"],
-    adjustment_percent=float(controls["adjustment_percent"]),
-    adjustment_start_month=int(controls["adjustment_start_month"]),
-    adjustment_end_month=int(controls["adjustment_end_month"]),
+    capacity_phases=controls["capacity_phases"],
     changepoint_prior_scale=float(controls["changepoint_prior_scale"]),
     interval_width=float(controls["interval_width"]),
 )
@@ -130,17 +129,23 @@ if "forecast_result" not in st.session_state:
     # Still show history if exists
     if st.session_state["forecast_history"]:
         st.subheader("Forecast run history (last 20)")
-        st.dataframe(pd.DataFrame(st.session_state["forecast_history"]), use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(st.session_state["forecast_history"]), use_container_width=True
+        )
     st.stop()
 
 result = st.session_state["forecast_result"]
 
 # Baseline for normalized MAE/RMSE interpretation
 series_df = _timeseries_to_pd(result.series).reset_index()
-val_cols = [c for c in series_df.columns if c.lower() not in ("time", "ds", "date", "index")]
+val_cols = [
+    c for c in series_df.columns if c.lower() not in ("time", "ds", "date", "index")
+]
 baseline = None
 if val_cols:
-    baseline = float(pd.to_numeric(series_df[val_cols[0]], errors="coerce").dropna().mean())
+    baseline = float(
+        pd.to_numeric(series_df[val_cols[0]], errors="coerce").dropna().mean()
+    )
 
 mape_v = float(result.performance_metrics.get("MAPE", float("nan")))
 mae_v = float(result.performance_metrics.get("MAE", float("nan")))
@@ -177,7 +182,9 @@ st.caption(f"Departments included: {result.department_info}")
 st.markdown("---")
 st.subheader("How to interpret these metrics & charts")
 
-with st.expander("Metric glossary + quick interpretation (backtesting & CV)", expanded=True):
+with st.expander(
+    "Metric glossary + quick interpretation (backtesting & CV)", expanded=True
+):
     st.markdown(
         """**Backtesting metrics (computed on historical forecasts):**
 
@@ -239,8 +246,16 @@ with st.expander("Chart guide: what each graph is telling you"):
     )
 
 
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📉 Forecast", "📅 Future Table", "🏛️ Fiscal Summary", "🧾 Run History", "📊 Prophet CV", "🧩 Prophet Plots"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+    [
+        "📉 Forecast",
+        "📅 Future Table",
+        "🏛️ Fiscal Summary",
+        "🧾 Run History",
+        "📊 Prophet CV",
+        "🧩 Prophet Plots",
+    ]
+)
 
 with tab1:
     ci_choice = st.radio(
@@ -251,7 +266,9 @@ with tab1:
     )
     ci_mode_val = "rmse_95" if ci_choice.startswith("95%") else "rmse_68"
 
-    fig = forecast_line_chart(result.future_forecast_df, mae=mae_v, rmse=rmse_v, ci_mode=ci_mode_val)
+    fig = forecast_line_chart(
+        result.future_forecast_df, mae=mae_v, rmse=rmse_v, ci_mode=ci_mode_val
+    )
     if fig is None:
         st.warning("No future dates found beyond the last historical date.")
     else:
@@ -294,31 +311,41 @@ with tab4:
         )
 
 
-
 with tab5:
     st.subheader("Prophet cross-validation (prophet.diagnostics)")
-st.caption("Cross-validation simulates forecasting from multiple cutoffs to estimate error across different horizons.")
-with st.expander("Interpretation tips (CV)", expanded=False):
-    st.markdown(
-        "- **Horizon** = how far ahead the model is predicting. Errors usually increase with horizon.\n"
-        "- **coverage** should be close to your interval width (e.g., ~0.90 for 90% intervals).\n"
-        "- If **rmse** is close to **mae**, errors are fairly uniform. If rmse >> mae, you have big misses.\n"
-        "- Use **mdape** when outliers or spikes distort mape.\n"
+    st.caption(
+        "Cross-validation simulates forecasting from multiple cutoffs to estimate error across different horizons."
     )
+    with st.expander("Interpretation tips (CV)", expanded=False):
+        st.markdown(
+            "- **Horizon** = how far ahead the model is predicting. Errors usually increase with horizon.\n"
+            "- **coverage** should be close to your interval width (e.g., ~0.90 for 90% intervals).\n"
+            "- If **rmse** is close to **mae**, errors are fairly uniform. If rmse >> mae, you have big misses.\n"
+            "- Use **mdape** when outliers or spikes distort mape.\n"
+        )
 
     cv_metrics = getattr(result, "prophet_cv_metrics_df", None)
     cv_raw = getattr(result, "prophet_cv_raw_df", None)
 
     if cv_metrics is None or getattr(cv_metrics, "empty", True):
-        st.info("Cross-validation metrics not available (often due to insufficient history for the default initial/period/horizon).")
+        st.info(
+            "Cross-validation metrics not available (often due to insufficient history for the default initial/period/horizon)."
+        )
         st.caption("Defaults: initial=730 days, period=180 days, horizon=365 days.")
     else:
-        st.caption("Prophet-native cross-validation metrics (performance_metrics output).")
+        st.caption(
+            "Prophet-native cross-validation metrics (performance_metrics output)."
+        )
         st.dataframe(cv_metrics.head(50), use_container_width=True)
 
         # Plot common metrics vs horizon
         import plotly.express as px
-        plot_cols = [c for c in ["mae","rmse","mape","mdape","smape","coverage"] if c in cv_metrics.columns]
+
+        plot_cols = [
+            c
+            for c in ["mae", "rmse", "mape", "mdape", "smape", "coverage"]
+            if c in cv_metrics.columns
+        ]
         if "horizon" in cv_metrics.columns and plot_cols:
             dfp = cv_metrics.copy()
             try:
@@ -330,7 +357,9 @@ with st.expander("Interpretation tips (CV)", expanded=False):
                 xlabel = "Horizon"
 
             for c in plot_cols:
-                figm = px.line(dfp, x=xcol, y=c, markers=True, title=f"{c.upper()} vs {xlabel}")
+                figm = px.line(
+                    dfp, x=xcol, y=c, markers=True, title=f"{c.upper()} vs {xlabel}"
+                )
                 st.plotly_chart(figm, use_container_width=True)
 
         st.download_button(
@@ -357,6 +386,7 @@ with tab6:
         st.info("Prophet forecast dataframe not available for plotting.")
     else:
         import plotly.graph_objects as go
+
         dfp = prophet_fc.copy()
         dfp["ds"] = pd.to_datetime(dfp["ds"])
 
@@ -364,11 +394,26 @@ with tab6:
 
         # Confidence interval from Prophet output (responds to interval_width)
         if "yhat_upper" in dfp.columns and "yhat_lower" in dfp.columns:
-            fig.add_trace(go.Scatter(x=dfp["ds"], y=dfp["yhat_upper"], mode="lines", name="yhat_upper", line=dict(dash="dot")))
-            fig.add_trace(go.Scatter(
-                x=dfp["ds"], y=dfp["yhat_lower"], mode="lines", name="yhat_lower", line=dict(dash="dot"),
-                fill="tonexty", fillcolor="rgba(0,0,0,0.10)"
-            ))
+            fig.add_trace(
+                go.Scatter(
+                    x=dfp["ds"],
+                    y=dfp["yhat_upper"],
+                    mode="lines",
+                    name="yhat_upper",
+                    line=dict(dash="dot"),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=dfp["ds"],
+                    y=dfp["yhat_lower"],
+                    mode="lines",
+                    name="yhat_lower",
+                    line=dict(dash="dot"),
+                    fill="tonexty",
+                    fillcolor="rgba(0,0,0,0.10)",
+                )
+            )
 
         fig.add_trace(go.Scatter(x=dfp["ds"], y=dfp["yhat"], mode="lines", name="yhat"))
 
@@ -380,4 +425,6 @@ with tab6:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        st.caption("Components (trend/seasonality) require the fitted Prophet model object to render exactly like Prophet. If you'd like, we can persist the fitted model in session_state to render full component plots.")
+        st.caption(
+            "Components (trend/seasonality) require the fitted Prophet model object to render exactly like Prophet. If you'd like, we can persist the fitted model in session_state to render full component plots."
+        )
