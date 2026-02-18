@@ -105,6 +105,9 @@ def test_forecast_visits_accepts_capacity_phases() -> None:
     forecast_frame = result.future_forecast_df.sort_values(
         "forecast_month"
     ).reset_index(drop=True)
-    assert forecast_frame.loc[0, "adj_applied"]
-    assert forecast_frame.loc[1, "adj_applied"]
-    assert forecast_frame.loc[2, "adj_applied"]
+    assert forecast_frame.loc[0, "adj_applied_any"]
+    assert forecast_frame.loc[1, "adj_applied_any"]
+    assert forecast_frame.loc[2, "adj_applied_any"]
+    assert forecast_frame.loc[0, "applied_phase_ids"] == "1"
+    assert forecast_frame.loc[1, "applied_phase_ids"] == "1,2"
+    assert forecast_frame.loc[2, "applied_phase_ids"] == "2"

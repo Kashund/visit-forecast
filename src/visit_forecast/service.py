@@ -127,7 +127,8 @@ def build_future_forecast_df(
 
     Output columns
     --------------
-    ds, yhat, yhat_original, yhat_adjusted, adj_applied, Fiscal_Year, forecast_month
+    ds, yhat, yhat_original, yhat_adjusted, adj_applied_any, applied_phase_ids,
+    Fiscal_Year, forecast_month
     """
     fc_df = _timeseries_to_df(forecast).reset_index()
 
@@ -167,18 +168,22 @@ def build_future_forecast_df(
 
     if fut.empty:
         fut["yhat_adjusted"] = fut["yhat_original"]
+        fut["adj_applied_any"] = False
+        fut["applied_phase_ids"] = ""
         fut["adj_applied"] = False
         fut = add_fiscal_year(fut, "ds")
         return fut
 
     fut["yhat_adjusted"] = fut["yhat_original"]
+    fut["adj_applied_any"] = False
+    fut["applied_phase_ids"] = ""
     fut["adj_applied"] = False
 
     normalized_phases = _normalize_capacity_phases(
         capacity_phases,
         forecast_periods=int(fut["forecast_month"].max()),
     )
-    for phase in normalized_phases:
+    for phase_index, phase in enumerate(normalized_phases, start=1):
         if not phase.enabled:
             continue
 
@@ -193,7 +198,19 @@ def build_future_forecast_df(
         percentage = float(phase.percent) / 100.0
         factor = 1.0 - percentage if phase.mode.lower() == "loss" else 1.0 + percentage
         fut.loc[in_range, "yhat_adjusted"] = fut.loc[in_range, "yhat_adjusted"] * factor
+        fut.loc[in_range, "adj_applied_any"] = True
+        fut.loc[in_range, "applied_phase_ids"] = fut.loc[
+            in_range, "applied_phase_ids"
+        ].map(
+            lambda existing_phase_ids: (
+                f"{existing_phase_ids},{phase_index}"
+                if existing_phase_ids
+                else str(phase_index)
+            )
+        )
         fut.loc[in_range, "adj_applied"] = True
+
+    fut["adj_applied"] = fut["adj_applied_any"]
 
     fut = add_fiscal_year(fut, "ds")
     return fut
@@ -286,11 +303,17 @@ def forecast_visits(
             future_df = future_df.merge(intervals, on="ds", how="left")
 
             # If capacity adjustment applies, scale bounds to follow the adjusted line
-            if {"adj_applied", "yhat_lower", "yhat_upper"}.issubset(future_df.columns):
+            if {
+                "adj_applied_any",
+                "yhat_adjusted",
+                "yhat_original",
+                "yhat_lower",
+                "yhat_upper",
+            }.issubset(future_df.columns):
                 f = (future_df["yhat_adjusted"] / future_df["yhat_original"]).fillna(
                     1.0
                 )
-                mask = future_df["adj_applied"] == True
+                mask = future_df["adj_applied_any"] == True
                 future_df.loc[mask, "yhat_lower"] = (
                     future_df.loc[mask, "yhat_lower"] * f.loc[mask]
                 )
