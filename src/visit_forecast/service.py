@@ -1,13 +1,93 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from dataclasses import dataclass
+from typing import Any, List, Optional
 
 import pandas as pd
 
 from .fiscal import add_fiscal_year, fiscal_summary
 from .io import load_data, prepare_dataframe
-from .model_prophet import backtest, fit_and_forecast, prophet_future_intervals, prophet_full_forecast_df, prophet_cross_validation_metrics
+from .model_prophet import (
+    backtest,
+    fit_and_forecast,
+    prophet_future_intervals,
+    prophet_full_forecast_df,
+    prophet_cross_validation_metrics,
+)
 from .types import ForecastResult
+
+
+@dataclass
+class CapacityPhase:
+    enabled: bool
+    mode: str
+    percent: float
+    start_month: int
+    end_month: int
+
+
+def _normalize_capacity_phases(
+    capacity_phases: Optional[List[CapacityPhase | dict[str, Any]]],
+    *,
+    forecast_periods: int,
+) -> List[CapacityPhase]:
+    """Normalize and validate capacity phase definitions.
+
+    Overlap precedence: enabled phases are applied sequentially in the provided
+    order using multiplicative factors.
+    """
+    if not capacity_phases:
+        return []
+
+    if len(capacity_phases) > 4:
+        raise ValueError("A maximum of 4 capacity phases is supported.")
+
+    normalized_phases: List[CapacityPhase] = []
+    for index, phase in enumerate(capacity_phases, start=1):
+        if isinstance(phase, CapacityPhase):
+            normalized_phase = phase
+        elif isinstance(phase, dict):
+            normalized_phase = CapacityPhase(
+                enabled=bool(phase.get("enabled", True)),
+                mode=str(phase.get("mode", "loss")),
+                percent=float(phase.get("percent", 0.0)),
+                start_month=int(phase.get("start_month", 1)),
+                end_month=int(phase.get("end_month", forecast_periods)),
+            )
+        else:
+            raise ValueError(f"Phase {index} must be a CapacityPhase or dict.")
+
+        _validate_capacity_phase(
+            normalized_phase, forecast_periods=forecast_periods, index=index
+        )
+        normalized_phases.append(normalized_phase)
+
+    return normalized_phases
+
+
+def _validate_capacity_phase(
+    phase: CapacityPhase, *, forecast_periods: int, index: int
+) -> None:
+    valid_modes = {"loss", "add"}
+    mode_value = str(phase.mode).lower()
+    if mode_value not in valid_modes:
+        raise ValueError(f"Phase {index}: mode must be one of {sorted(valid_modes)}.")
+
+    if phase.percent < 0:
+        raise ValueError(f"Phase {index}: percent must be >= 0.")
+
+    if not 1 <= phase.start_month <= forecast_periods:
+        raise ValueError(
+            f"Phase {index}: start_month must be within 1 and {forecast_periods}."
+        )
+
+    if not 1 <= phase.end_month <= forecast_periods:
+        raise ValueError(
+            f"Phase {index}: end_month must be within 1 and {forecast_periods}."
+        )
+
+    if phase.end_month < phase.start_month:
+        raise ValueError(f"Phase {index}: end_month must be >= start_month.")
 
 
 def _timeseries_to_df(ts) -> pd.DataFrame:
@@ -25,29 +105,25 @@ def _timeseries_to_df(ts) -> pd.DataFrame:
         return ts.to_dataframe()
     if hasattr(ts, "pandas_dataframe"):
         return ts.pandas_dataframe()
-    raise AttributeError("Unsupported Darts TimeSeries version: cannot convert to DataFrame.")
-
-
+    raise AttributeError(
+        "Unsupported Darts TimeSeries version: cannot convert to DataFrame."
+    )
 
 
 def build_future_forecast_df(
     forecast,
     last_hist_date: pd.Timestamp,
-    adjustment_mode: str,
-    adjustment_percent: float,
-    adjustment_start_month: int,
-    adjustment_end_month: int,
+    capacity_phases: Optional[List[CapacityPhase | dict[str, Any]]] = None,
 ) -> pd.DataFrame:
-    """Build a standardized future forecast DataFrame with *selective* capacity adjustments.
+    """Build a standardized future forecast DataFrame with selective capacity adjustments.
 
     Parameters
     ----------
-    adjustment_mode:
-        'loss' or 'add'
-    adjustment_percent:
-        percent magnitude (e.g., 10 => 10% loss or add)
-    adjustment_start_month / adjustment_end_month:
-        1-indexed forecast month range (relative to first future month) where adjustment applies, inclusive.
+    capacity_phases:
+        List of phase dictionaries or CapacityPhase dataclass instances.
+        Supported keys/fields: enabled, mode (loss|add), percent,
+        start_month, end_month.
+        Overlap precedence is sequential multiplicative application in list order.
 
     Output columns
     --------------
@@ -95,22 +171,29 @@ def build_future_forecast_df(
         fut = add_fiscal_year(fut, "ds")
         return fut
 
-    # Clamp month range
-    adjustment_start_month = max(1, int(adjustment_start_month))
-    adjustment_end_month = max(adjustment_start_month, int(adjustment_end_month))
-    max_m = int(fut["forecast_month"].max())
-    adjustment_start_month = min(adjustment_start_month, max_m)
-    adjustment_end_month = min(adjustment_end_month, max_m)
-
-    in_range = fut["forecast_month"].between(adjustment_start_month, adjustment_end_month, inclusive="both")
-    fut["adj_applied"] = in_range
-
-    p = float(adjustment_percent) / 100.0
-    mode = (adjustment_mode or "loss").lower()
-    factor = 1.0 + p if mode in ["add", "increase", "gain"] else 1.0 - p
-
     fut["yhat_adjusted"] = fut["yhat_original"]
-    fut.loc[in_range, "yhat_adjusted"] = fut.loc[in_range, "yhat_original"] * factor
+    fut["adj_applied"] = False
+
+    normalized_phases = _normalize_capacity_phases(
+        capacity_phases,
+        forecast_periods=int(fut["forecast_month"].max()),
+    )
+    for phase in normalized_phases:
+        if not phase.enabled:
+            continue
+
+        in_range = fut["forecast_month"].between(
+            phase.start_month,
+            phase.end_month,
+            inclusive="both",
+        )
+        if not in_range.any():
+            continue
+
+        percentage = float(phase.percent) / 100.0
+        factor = 1.0 - percentage if phase.mode.lower() == "loss" else 1.0 + percentage
+        fut.loc[in_range, "yhat_adjusted"] = fut.loc[in_range, "yhat_adjusted"] * factor
+        fut.loc[in_range, "adj_applied"] = True
 
     fut = add_fiscal_year(fut, "ds")
     return fut
@@ -129,6 +212,7 @@ def forecast_visits(
     adjustment_percent: float = 0.0,
     adjustment_start_month: int = 1,
     adjustment_end_month: int = 12,
+    capacity_phases: Optional[List[CapacityPhase | dict[str, Any]]] = None,
     exclude_departments: Optional[List[str]] = None,
     changepoint_prior_scale: float = 0.05,
     interval_width: float = 0.90,
@@ -136,7 +220,27 @@ def forecast_visits(
     if forecast_periods <= 0:
         raise ValueError("forecast_periods must be > 0")
 
-    df_raw = df if df is not None else load_data(use_synthetic, filename, timeframe_start, timeframe_end)
+    if capacity_phases is None:
+        capacity_phases = [
+            CapacityPhase(
+                enabled=True,
+                mode=adjustment_mode,
+                percent=adjustment_percent,
+                start_month=adjustment_start_month,
+                end_month=adjustment_end_month,
+            )
+        ]
+
+    normalized_capacity_phases = _normalize_capacity_phases(
+        capacity_phases,
+        forecast_periods=forecast_periods,
+    )
+
+    df_raw = (
+        df
+        if df is not None
+        else load_data(use_synthetic, filename, timeframe_start, timeframe_end)
+    )
 
     df_prepared, dept_info = prepare_dataframe(
         df_raw=df_raw,
@@ -167,10 +271,7 @@ def forecast_visits(
     future_df = build_future_forecast_df(
         forecast,
         last_hist_date,
-        adjustment_mode=adjustment_mode,
-        adjustment_percent=adjustment_percent,
-        adjustment_start_month=adjustment_start_month,
-        adjustment_end_month=adjustment_end_month,
+        capacity_phases=normalized_capacity_phases,
     )
 
     # Uncertainty intervals from Prophet (interval_width controls these)
@@ -186,10 +287,16 @@ def forecast_visits(
 
             # If capacity adjustment applies, scale bounds to follow the adjusted line
             if {"adj_applied", "yhat_lower", "yhat_upper"}.issubset(future_df.columns):
-                f = (future_df["yhat_adjusted"] / future_df["yhat_original"]).fillna(1.0)
+                f = (future_df["yhat_adjusted"] / future_df["yhat_original"]).fillna(
+                    1.0
+                )
                 mask = future_df["adj_applied"] == True
-                future_df.loc[mask, "yhat_lower"] = future_df.loc[mask, "yhat_lower"] * f.loc[mask]
-                future_df.loc[mask, "yhat_upper"] = future_df.loc[mask, "yhat_upper"] * f.loc[mask]
+                future_df.loc[mask, "yhat_lower"] = (
+                    future_df.loc[mask, "yhat_lower"] * f.loc[mask]
+                )
+                future_df.loc[mask, "yhat_upper"] = (
+                    future_df.loc[mask, "yhat_upper"] * f.loc[mask]
+                )
     except Exception:
         # Intervals are optional; UI will fall back to RMSE-based approximation
         pass
@@ -197,7 +304,9 @@ def forecast_visits(
     # Prophet-native forecast dataframe (for Prophet plots)
     prophet_fc_df = None
     try:
-        prophet_fc_df = prophet_full_forecast_df(model, forecast_periods=forecast_periods, freq="MS")
+        prophet_fc_df = prophet_full_forecast_df(
+            model, forecast_periods=forecast_periods, freq="MS"
+        )
     except Exception:
         prophet_fc_df = None
 
@@ -220,5 +329,4 @@ def forecast_visits(
         prophet_forecast_df=prophet_fc_df,
         prophet_cv_metrics_df=cv_metrics,
         prophet_cv_raw_df=cv_raw,
-        )
-
+    )
