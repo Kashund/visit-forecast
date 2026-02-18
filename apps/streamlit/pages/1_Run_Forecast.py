@@ -55,6 +55,30 @@ def _score_label(metric_name: str, value: float, baseline: float | None = None):
     return ("Poor", "🟥")
 
 
+def _build_phase_scenario_summary(capacity_phases: list[dict] | None) -> str:
+    if not capacity_phases:
+        return "No phases configured"
+
+    enabled_phase_summaries = []
+    for phase_number, phase in enumerate(capacity_phases, start=1):
+        if not bool(phase.get("enabled", False)):
+            continue
+
+        mode_value = str(phase.get("mode", "")).lower()
+        mode_label = "Loss" if mode_value == "loss" else "Add"
+        phase_percent = float(phase.get("percent", 0.0))
+        start_month = int(phase.get("start_month", 1))
+        end_month = int(phase.get("end_month", start_month))
+        enabled_phase_summaries.append(
+            f"P{phase_number} {mode_label} {phase_percent:.1f}% M{start_month}-M{end_month}"
+        )
+
+    if not enabled_phase_summaries:
+        return "No enabled phases"
+
+    return " | ".join(enabled_phase_summaries)
+
+
 # Initialize history store
 if "forecast_history" not in st.session_state:
     st.session_state["forecast_history"] = []  # list[dict]
@@ -108,11 +132,14 @@ if controls["run"]:
     st.session_state["forecast_result"] = result
     st.session_state["forecast_inputs"] = {k: v for k, v in common.items()}
     st.session_state["forecast_source_mode"] = controls["source_mode"]
+    scenario_summary = _build_phase_scenario_summary(controls["capacity_phases"])
+    st.session_state["forecast_scenario_summary"] = scenario_summary
 
     # Append to history (keep last 20)
     entry = {
         "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_mode": controls["source_mode"],
+        "scenario_summary": scenario_summary,
         **common,
         "MAPE": float(result.performance_metrics.get("MAPE", float("nan"))),
         "MAE": float(result.performance_metrics.get("MAE", float("nan"))),
@@ -267,7 +294,13 @@ with tab1:
     ci_mode_val = "rmse_95" if ci_choice.startswith("95%") else "rmse_68"
 
     fig = forecast_line_chart(
-        result.future_forecast_df, mae=mae_v, rmse=rmse_v, ci_mode=ci_mode_val
+        result.future_forecast_df,
+        mae=mae_v,
+        rmse=rmse_v,
+        ci_mode=ci_mode_val,
+        phase_metadata=st.session_state.get("forecast_inputs", {}).get(
+            "capacity_phases"
+        ),
     )
     if fig is None:
         st.warning("No future dates found beyond the last historical date.")
@@ -275,10 +308,18 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True)
 
 with tab2:
-    st.dataframe(result.future_forecast_df, use_container_width=True)
+    scenario_summary = st.session_state.get(
+        "forecast_scenario_summary",
+        _build_phase_scenario_summary(
+            st.session_state.get("forecast_inputs", {}).get("capacity_phases")
+        ),
+    )
+    future_table_df = result.future_forecast_df.copy()
+    future_table_df["scenario_summary"] = scenario_summary
+    st.dataframe(future_table_df, use_container_width=True)
     st.download_button(
         "Download future forecast CSV",
-        data=result.future_forecast_df.to_csv(index=False).encode("utf-8"),
+        data=future_table_df.to_csv(index=False).encode("utf-8"),
         file_name="future_forecast.csv",
         mime="text/csv",
     )
