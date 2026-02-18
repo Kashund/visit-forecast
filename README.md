@@ -77,14 +77,60 @@ If you're on very new pandas versions, month-start normalization uses `to_timest
 - Backtesting automatically adapts when you choose long forecast horizons.
 
 ## Capacity adjustment
-In the Streamlit app you can:
-- Choose **Capacity loss** or **Capacity add**
-- Choose the adjustment percentage
-- Apply it only to a slice of the forecast horizon (e.g., months 2–12)
+Capacity adjustments support both the original single-phase inputs and new multi-phase configuration.
+
+### Single-phase (backward compatible)
+You can still provide:
+- `adjustment_mode` (`loss` or `add`)
+- `adjustment_percent`
+- `adjustment_start_month` and `adjustment_end_month`
+
+If `capacity_phases` is not provided, these legacy inputs are converted into one phase internally.
+
+### Multi-phase configuration
+Provide `capacity_phases` as a list of up to four phase objects:
+- `enabled` (bool)
+- `mode` (`loss` or `add`)
+- `percent` (non-negative)
+- `start_month` and `end_month` (1-indexed and within the forecast horizon)
+
+Example configuration:
+- Months 1–3 add 10%
+- Months 5–7 loss 15%
+
+```python
+capacity_phases = [
+    {"enabled": True, "mode": "add", "percent": 10, "start_month": 1, "end_month": 3},
+    {"enabled": True, "mode": "loss", "percent": 15, "start_month": 5, "end_month": 7},
+]
+```
+
+### Toggle and overlap behavior
+- Disabled phases (`enabled=False`) are ignored and do not affect output.
+- Disjoint phases apply only to their own month ranges.
+- Overlapping enabled phases are applied sequentially in the list order (multiplicative factors).
+- The output includes `applied_phase_ids` so you can see exactly which phase(s) affected each forecast month.
+
+### CLI examples
+JSON payload:
+```bash
+python scripts/run_forecast_cli.py \
+  --use_synthetic \
+  --capacity_phases_json '[{"enabled": true, "mode": "add", "percent": 10, "start_month": 1, "end_month": 3}, {"enabled": true, "mode": "loss", "percent": 15, "start_month": 5, "end_month": 7}]'
+```
+
+Repeated `--phase` arguments:
+```bash
+python scripts/run_forecast_cli.py \
+  --use_synthetic \
+  --phase add:10:1:3 \
+  --phase loss:15:5:7
+```
 
 The future forecast table includes:
 - `forecast_month` (1-indexed)
 - `adj_applied` (True/False)
+- `applied_phase_ids` (comma-separated phase order)
 
 ## Forecast validation (backtesting)
 The app reports:
