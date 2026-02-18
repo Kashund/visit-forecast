@@ -57,7 +57,9 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             df_preview = _read_pasted_csv(pasted_text)
 
     else:
-        st.sidebar.caption("Synthetic data includes: Cardiology, Oncology, Neurology (monthly).")
+        st.sidebar.caption(
+            "Synthetic data includes: Cardiology, Oncology, Neurology (monthly)."
+        )
 
     st.sidebar.divider()
 
@@ -87,39 +89,60 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     )
 
     st.sidebar.divider()
-    st.sidebar.markdown("**Capacity adjustment**")
+    st.sidebar.markdown("**Capacity adjustment phases**")
 
-    adjustment_mode_label = st.sidebar.selectbox(
-        "Capacity adjustment",
-        ["Capacity loss", "Capacity add"],
-        index=0,
-        key="adj_mode",
-        help="Loss reduces forecasted visits; Add increases forecasted visits.",
-    )
-    adjustment_mode = "loss" if adjustment_mode_label == "Capacity loss" else "add"
-
-    adjustment_percent = float(
-        st.sidebar.slider(
-            "Adjustment (%)",
-            0,
-            50,
-            0,
-            key="adj_pct",
-            help="Percent magnitude applied in the selected month range (e.g., 10% loss => multiply by 0.90).",
-        )
-    )
-
+    capacity_phases = []
     default_end = min(12, forecast_periods)
-    month_range = st.sidebar.slider(
-        "Apply adjustment between forecast months",
-        min_value=1,
-        max_value=forecast_periods,
-        value=(1, default_end),
-        step=1,
-        key="adj_between",
-        help="1 = first forecasted future month. The adjustment applies only within this inclusive range.",
-    )
-    adjustment_start_month, adjustment_end_month = int(month_range[0]), int(month_range[1])
+    default_month_range = (1, default_end)
+
+    for phase_number in range(1, 5):
+        is_first_phase = phase_number == 1
+        with st.sidebar.expander(f"Phase {phase_number}", expanded=is_first_phase):
+            phase_enabled = st.checkbox(
+                "Enabled",
+                value=is_first_phase,
+                key=f"phase_{phase_number}_enabled",
+            )
+
+            phase_mode_label = st.selectbox(
+                "Mode",
+                ["Capacity loss", "Capacity add"],
+                index=0,
+                key=f"phase_{phase_number}_mode",
+                help="Loss reduces forecasted visits; Add increases forecasted visits.",
+            )
+            phase_mode = "loss" if phase_mode_label == "Capacity loss" else "add"
+
+            phase_percent = float(
+                st.slider(
+                    "Percent (%)",
+                    0,
+                    50,
+                    0,
+                    key=f"phase_{phase_number}_percent",
+                    help="Percent magnitude applied in the selected month range.",
+                )
+            )
+
+            phase_month_range = st.slider(
+                "Apply between forecast months",
+                min_value=1,
+                max_value=forecast_periods,
+                value=default_month_range,
+                step=1,
+                key=f"phase_{phase_number}_between",
+                help="1 = first forecasted future month. Applies within this inclusive range.",
+            )
+
+            capacity_phases.append(
+                {
+                    "enabled": phase_enabled,
+                    "mode": phase_mode,
+                    "percent": phase_percent,
+                    "start_month": int(phase_month_range[0]),
+                    "end_month": int(phase_month_range[1]),
+                }
+            )
 
     st.sidebar.divider()
     st.sidebar.markdown("**Model tuning (advanced)**")
@@ -185,10 +208,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "forecast_periods": forecast_periods,
         "department": department,
         "exclude_departments": exclude_departments,
-        "adjustment_mode": adjustment_mode,
-        "adjustment_percent": adjustment_percent,
-        "adjustment_start_month": adjustment_start_month,
-        "adjustment_end_month": adjustment_end_month,
+        "capacity_phases": capacity_phases,
         "changepoint_prior_scale": changepoint_prior_scale,
         "interval_width": interval_width,
         "run": run,
