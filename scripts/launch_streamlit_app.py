@@ -11,7 +11,7 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
-from typing import Sequence
+from typing import Optional, Sequence
 
 
 def wait_for_port(host: str, port: int, timeout_seconds: int) -> bool:
@@ -35,19 +35,10 @@ def has_streamlit_module(python_executable: str) -> bool:
 
 def build_streamlit_launch_command(
     app_file_path: Path, host: str, port: int
-) -> Sequence[str] | None:
+) -> Optional[Sequence[str]]:
     """Build the best available launch command for Streamlit."""
     if has_streamlit_module(sys.executable):
         return [
-def main() -> int:
-    repository_root = Path(__file__).resolve().parents[1]
-    app_file_path = repository_root / "apps" / "streamlit" / "Home.py"
-    host = "127.0.0.1"
-    port = 8501
-    application_url = f"http://{host}:{port}"
-
-    streamlit_process = subprocess.Popen(
-        [
             sys.executable,
             "-m",
             "streamlit",
@@ -94,9 +85,6 @@ def main() -> int:
         return 1
 
     streamlit_process = subprocess.Popen(launch_command, cwd=repository_root)
-        ],
-        cwd=repository_root,
-    )
 
     if wait_for_port(host=host, port=port, timeout_seconds=30):
         webbrowser.open(application_url)
