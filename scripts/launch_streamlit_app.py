@@ -39,6 +39,15 @@ def build_streamlit_launch_command(
     """Build the best available launch command for Streamlit."""
     if has_streamlit_module(sys.executable):
         return [
+def main() -> int:
+    repository_root = Path(__file__).resolve().parents[1]
+    app_file_path = repository_root / "apps" / "streamlit" / "Home.py"
+    host = "127.0.0.1"
+    port = 8501
+    application_url = f"http://{host}:{port}"
+
+    streamlit_process = subprocess.Popen(
+        [
             sys.executable,
             "-m",
             "streamlit",
@@ -85,6 +94,9 @@ def main() -> int:
         return 1
 
     streamlit_process = subprocess.Popen(launch_command, cwd=repository_root)
+        ],
+        cwd=repository_root,
+    )
 
     if wait_for_port(host=host, port=port, timeout_seconds=30):
         webbrowser.open(application_url)
