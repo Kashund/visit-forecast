@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from bootstrap import ensure_project_paths
 import streamlit as st
 import pandas as pd
+
+ensure_project_paths()
+
+from visit_forecast.io import to_month_start
 
 st.set_page_config(page_title="Data Check", page_icon="✅", layout="wide")
 st.title("✅ Data Check")
@@ -40,7 +45,7 @@ st.write("Null counts")
 st.dataframe(df2[["Date", "Visits", "Department"]].isna().sum().to_frame("nulls"), use_container_width=True)
 
 df2 = df2.dropna(subset=["Date"])
-df2["Date"] = df2["Date"].dt.to_period("M").dt.to_timestamp("MS")
+df2["Date"] = to_month_start(df2["Date"])
 
 min_d, max_d = df2["Date"].min(), df2["Date"].max()
 all_months = pd.date_range(min_d, max_d, freq="MS")

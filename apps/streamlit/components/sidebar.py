@@ -147,6 +147,22 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     st.sidebar.divider()
     st.sidebar.markdown("**Model tuning (advanced)**")
 
+    parameter_selection_mode = st.sidebar.radio(
+        "Parameter selection",
+        ["Manual", "Auto-tune"],
+        horizontal=True,
+        key="parameter_selection_mode",
+        help="Manual uses the sliders below. Auto-tune searches a moderate candidate set for this run.",
+    )
+    tuning_mode = "auto" if parameter_selection_mode == "Auto-tune" else "manual"
+
+    if tuning_mode == "auto":
+        st.sidebar.caption(
+            "Auto-tune searches changepoint prior scale "
+            "[0.01, 0.03, 0.05, 0.10, 0.20] by balancing MAPE and RMSE, "
+            "and interval width [0.80, 0.85, 0.90, 0.95] by coverage calibration."
+        )
+
     changepoint_prior_scale = float(
         st.sidebar.slider(
             "Changepoint prior scale",
@@ -155,6 +171,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.05,
             key="cp",
             help="Higher values allow the trend to change more aggressively (more flexible, higher overfit risk).",
+            disabled=tuning_mode == "auto",
         )
     )
     interval_width = float(
@@ -165,6 +182,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.90,
             key="iw",
             help="Uncertainty interval width used by Prophet (e.g., 0.90 = 90% interval).",
+            disabled=tuning_mode == "auto",
         )
     )
 
@@ -211,6 +229,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "capacity_phases": capacity_phases,
         "changepoint_prior_scale": changepoint_prior_scale,
         "interval_width": interval_width,
+        "tuning_mode": tuning_mode,
         "run": run,
     }
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from statistics import NormalDist
+
 import pandas as pd
 import plotly.graph_objects as go
 
@@ -9,6 +11,7 @@ def forecast_line_chart(
     mae: float | None = None,
     rmse: float | None = None,
     ci_mode: str = "rmse_95",
+    source_interval_width: float | None = None,
     phase_metadata: list[dict] | None = None,
 ):
     """Forecast chart with optional confidence interval + error bands.
@@ -37,22 +40,38 @@ def forecast_line_chart(
             break
 
     if lower_col and upper_col:
+        center = (df[upper_col] + df[lower_col]) / 2.0
+        half_width = (df[upper_col] - df[lower_col]).abs() / 2.0
+
+        target_label = "95%"
+        scaled_upper = df[upper_col]
+        scaled_lower = df[lower_col]
+
+        if source_interval_width is not None and 0 < source_interval_width < 1:
+            source_z = NormalDist().inv_cdf((1.0 + float(source_interval_width)) / 2.0)
+            target_z = 1.96 if ci_mode == "rmse_95" else 1.0
+            if source_z > 0:
+                width_scale = target_z / source_z
+                scaled_upper = center + half_width * width_scale
+                scaled_lower = center - half_width * width_scale
+                target_label = "95%" if ci_mode == "rmse_95" else "68%"
+
         # Plot as two boundary lines, plus a fill trace so hover shows actual numbers.
         fig.add_trace(
             go.Scatter(
                 x=x,
-                y=df[upper_col],
+                y=scaled_upper,
                 mode="lines",
-                name="CI upper",
+                name=f"CI upper ({target_label})",
                 line=dict(dash="dot"),
             )
         )
         fig.add_trace(
             go.Scatter(
                 x=x,
-                y=df[lower_col],
+                y=scaled_lower,
                 mode="lines",
-                name="CI lower",
+                name=f"CI lower ({target_label})",
                 line=dict(dash="dot"),
                 fill="tonexty",
                 fillcolor="rgba(0,0,0,0.10)",

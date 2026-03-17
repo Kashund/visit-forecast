@@ -14,6 +14,7 @@ from .model_prophet import (
     prophet_full_forecast_df,
     prophet_cross_validation_metrics,
 )
+from .tuning import select_prophet_hyperparameters
 from .types import ForecastResult
 
 
@@ -233,6 +234,7 @@ def forecast_visits(
     exclude_departments: Optional[List[str]] = None,
     changepoint_prior_scale: float = 0.05,
     interval_width: float = 0.90,
+    tuning_mode: str = "manual",
 ) -> ForecastResult:
     if forecast_periods <= 0:
         raise ValueError("forecast_periods must be > 0")
@@ -244,7 +246,7 @@ def forecast_visits(
                 mode=adjustment_mode,
                 percent=adjustment_percent,
                 start_month=adjustment_start_month,
-                end_month=adjustment_end_month,
+                end_month=min(adjustment_end_month, forecast_periods),
             )
         ]
 
@@ -269,11 +271,34 @@ def forecast_visits(
 
     df_prepared = add_fiscal_year(df_prepared, "ds")
 
+    selected_changepoint_prior_scale = float(changepoint_prior_scale)
+    selected_interval_width = float(interval_width)
+    tuning_primary_metric = None
+    tuning_primary_score = None
+    tuning_note = None
+    tuning_diagnostics_df = None
+
+    if tuning_mode == "auto":
+        tuning_selection = select_prophet_hyperparameters(
+            df_prepared=df_prepared,
+            forecast_periods=forecast_periods,
+        )
+        selected_changepoint_prior_scale = (
+            tuning_selection.changepoint_prior_scale
+        )
+        selected_interval_width = tuning_selection.interval_width
+        tuning_primary_metric = tuning_selection.primary_metric
+        tuning_primary_score = tuning_selection.primary_score
+        tuning_note = tuning_selection.note
+        tuning_diagnostics_df = tuning_selection.diagnostics_df
+    elif tuning_mode != "manual":
+        raise ValueError("tuning_mode must be either 'manual' or 'auto'")
+
     series, forecast, model = fit_and_forecast(
         df_prepared=df_prepared,
         forecast_periods=forecast_periods,
-        changepoint_prior_scale=changepoint_prior_scale,
-        interval_width=interval_width,
+        changepoint_prior_scale=selected_changepoint_prior_scale,
+        interval_width=selected_interval_width,
     )
 
     metrics = backtest(
@@ -352,4 +377,11 @@ def forecast_visits(
         prophet_forecast_df=prophet_fc_df,
         prophet_cv_metrics_df=cv_metrics,
         prophet_cv_raw_df=cv_raw,
+        tuning_mode=tuning_mode,
+        selected_changepoint_prior_scale=selected_changepoint_prior_scale,
+        selected_interval_width=selected_interval_width,
+        tuning_primary_metric=tuning_primary_metric,
+        tuning_primary_score=tuning_primary_score,
+        tuning_note=tuning_note,
+        tuning_diagnostics_df=tuning_diagnostics_df,
     )

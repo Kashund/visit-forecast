@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 import socket
 import subprocess
@@ -68,6 +69,7 @@ def build_streamlit_launch_command(
 def main() -> int:
     repository_root = Path(__file__).resolve().parents[1]
     app_file_path = repository_root / "apps" / "streamlit" / "Home.py"
+    source_root = repository_root / "src"
     host = "127.0.0.1"
     port = 8501
     application_url = f"http://{host}:{port}"
@@ -84,7 +86,18 @@ def main() -> int:
         )
         return 1
 
-    streamlit_process = subprocess.Popen(launch_command, cwd=repository_root)
+    launch_environment = os.environ.copy()
+    pythonpath_entries = [str(source_root)]
+    existing_pythonpath = launch_environment.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    launch_environment["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+
+    streamlit_process = subprocess.Popen(
+        launch_command,
+        cwd=repository_root,
+        env=launch_environment,
+    )
 
     if wait_for_port(host=host, port=port, timeout_seconds=30):
         webbrowser.open(application_url)

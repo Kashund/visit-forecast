@@ -1,4 +1,7 @@
+from bootstrap import ensure_project_paths
 import streamlit as st
+
+ensure_project_paths()
 
 st.set_page_config(page_title="Visit Forecast", page_icon="📈", layout="wide")
 

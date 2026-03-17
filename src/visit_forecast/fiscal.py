@@ -71,6 +71,54 @@ def aggregate_summary_by_period(
     return merged_summary
 
 
+def append_fiscal_year_totals(quarter_summary_df: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {
+        "Fiscal_Year",
+        "Fiscal_Quarter",
+        "Fiscal_Period_Label",
+        "Historical_Visits",
+        "Forecast_Original",
+        "Forecast_Adjusted",
+    }
+    missing_columns = required_columns.difference(quarter_summary_df.columns)
+    if missing_columns:
+        missing_columns_list = ", ".join(sorted(missing_columns))
+        raise ValueError(
+            "quarter_summary_df is missing required columns: "
+            f"{missing_columns_list}"
+        )
+
+    if quarter_summary_df.empty:
+        return quarter_summary_df.copy()
+
+    value_columns = [
+        "Historical_Visits",
+        "Forecast_Original",
+        "Forecast_Adjusted",
+    ]
+
+    detail_rows = quarter_summary_df.copy()
+    detail_rows["Fiscal_Quarter"] = detail_rows["Fiscal_Quarter"].astype("Int64")
+    detail_rows["_sort_order"] = detail_rows["Fiscal_Quarter"]
+
+    total_rows = (
+        detail_rows.groupby("Fiscal_Year", as_index=False)[value_columns].sum()
+    )
+    total_rows["Fiscal_Quarter"] = pd.Series([pd.NA] * len(total_rows), dtype="Int64")
+    total_rows["Fiscal_Period_Label"] = (
+        "FY" + total_rows["Fiscal_Year"].astype(int).astype(str) + " Total"
+    )
+    total_rows["_sort_order"] = 5
+
+    combined_summary = pd.concat(
+        [detail_rows, total_rows[detail_rows.columns]], ignore_index=True
+    )
+    combined_summary = combined_summary.sort_values(
+        ["Fiscal_Year", "_sort_order"]
+    ).reset_index(drop=True)
+    return combined_summary.drop(columns="_sort_order")
+
+
 def fiscal_summary(hist_df: pd.DataFrame, future_df: pd.DataFrame) -> pd.DataFrame:
     return aggregate_summary_by_period(hist_df, future_df, period="year")
 

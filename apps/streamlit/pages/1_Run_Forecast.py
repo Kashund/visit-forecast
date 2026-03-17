@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+from bootstrap import ensure_project_paths
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 
+ensure_project_paths()
+
 from visit_forecast import forecast_visits
-from visit_forecast.fiscal import aggregate_summary_by_period
+from visit_forecast.cv import add_prophet_cv_indicators
+from visit_forecast.fiscal import (
+    aggregate_summary_by_period,
+    append_fiscal_year_totals,
+)
 from components.sidebar import sidebar_controls
 from components.charts import forecast_line_chart, fiscal_bar_chart
 
@@ -80,6 +87,106 @@ def _build_phase_scenario_summary(capacity_phases: list[dict] | None) -> str:
     return " | ".join(enabled_phase_summaries)
 
 
+def _style_fiscal_summary_table(summary_df: pd.DataFrame):
+    display_df = summary_df.copy()
+    formatted_numeric_columns = [
+        column_name
+        for column_name in display_df.select_dtypes(include="number").columns
+        if column_name not in {"Fiscal_Year", "Fiscal_Quarter"}
+    ]
+
+    styler = display_df.style.format(
+        {column_name: "{:.1f}" for column_name in formatted_numeric_columns}
+    )
+
+    if "Fiscal_Period_Label" not in display_df.columns:
+        return styler
+
+    def _row_style(row: pd.Series):
+        is_total_row = str(row.get("Fiscal_Period_Label", "")).endswith("Total")
+        style = "font-weight: bold" if is_total_row else ""
+        return [style] * len(row)
+
+    return styler.apply(_row_style, axis=1)
+
+
+def _style_prophet_cv_table(cv_display_df: pd.DataFrame):
+    display_df = cv_display_df.copy()
+
+    numeric_formatters = {
+        column_name: "{:.4f}"
+        for column_name in display_df.columns
+        if pd.api.types.is_numeric_dtype(display_df[column_name])
+        and not pd.api.types.is_timedelta64_dtype(display_df[column_name])
+        and column_name != "Horizon_Days"
+    }
+    if "Horizon_Days" in display_df.columns:
+        numeric_formatters["Horizon_Days"] = "{:.0f}"
+    timedelta_formatters = {
+        column_name: (
+            lambda value: ""
+            if pd.isna(value)
+            else f"{int(pd.to_timedelta(value).total_seconds() // 86400)} days"
+        )
+        for column_name in display_df.columns
+        if pd.api.types.is_timedelta64_dtype(display_df[column_name])
+    }
+
+    status_styles = {
+        "On target": "background-color: rgba(46, 125, 50, 0.18); font-weight: 600;",
+        "Watch": "background-color: rgba(245, 124, 0, 0.18); font-weight: 600;",
+        "Off target": "background-color: rgba(198, 40, 40, 0.18); font-weight: 600;",
+        "Uniform": "background-color: rgba(46, 125, 50, 0.18); font-weight: 600;",
+        "Some spikes": "background-color: rgba(245, 124, 0, 0.18); font-weight: 600;",
+        "Big misses": "background-color: rgba(198, 40, 40, 0.18); font-weight: 600;",
+        "Aligned": "background-color: rgba(46, 125, 50, 0.18); font-weight: 600;",
+        "Some outliers": "background-color: rgba(245, 124, 0, 0.18); font-weight: 600;",
+        "MDAPE more reliable": "background-color: rgba(198, 40, 40, 0.18); font-weight: 600;",
+        "Baseline": "background-color: rgba(96, 125, 139, 0.16); font-weight: 600;",
+        "Improving": "background-color: rgba(46, 125, 50, 0.18); font-weight: 600;",
+        "Stable": "background-color: rgba(2, 136, 209, 0.16); font-weight: 600;",
+        "Higher error": "background-color: rgba(245, 124, 0, 0.18); font-weight: 600;",
+        "Sharp jump": "background-color: rgba(198, 40, 40, 0.18); font-weight: 600;",
+    }
+    status_columns = [
+        column_name
+        for column_name in [
+            "Horizon_Trend",
+            "Coverage_Check",
+            "Error_Shape",
+            "Outlier_Check",
+        ]
+        if column_name in display_df.columns
+    ]
+
+    styler = display_df.style.format({**numeric_formatters, **timedelta_formatters})
+    for column_name in status_columns:
+        styler = styler.map(lambda value: status_styles.get(str(value), ""), subset=[column_name])
+    return styler
+
+
+def _style_tuning_diagnostics_table(tuning_df: pd.DataFrame):
+    display_df = tuning_df.copy()
+    styler = display_df.style.format(
+        {
+            "candidate_value": "{:.2f}",
+            "primary_score_value": "{:.4f}",
+            "tie_breaker_value": "{:.4f}",
+        },
+        na_rep="n/a",
+    )
+
+    def _row_style(row: pd.Series):
+        selected_style = (
+            "font-weight: bold; background-color: rgba(46, 125, 50, 0.14);"
+            if bool(row.get("selected", False))
+            else ""
+        )
+        return [selected_style] * len(row)
+
+    return styler.apply(_row_style, axis=1)
+
+
 # Initialize history store
 if "forecast_history" not in st.session_state:
     st.session_state["forecast_history"] = []  # list[dict]
@@ -117,6 +224,7 @@ common = dict(
     capacity_phases=controls["capacity_phases"],
     changepoint_prior_scale=float(controls["changepoint_prior_scale"]),
     interval_width=float(controls["interval_width"]),
+    tuning_mode=str(controls["tuning_mode"]),
 )
 
 # --- Compute only when Run clicked ---
@@ -130,8 +238,15 @@ if controls["run"]:
                 st.stop()
             result = forecast_visits(df=df_preview, **common)
 
+    used_forecast_inputs = {
+        **common,
+        "changepoint_prior_scale": result.selected_changepoint_prior_scale,
+        "interval_width": result.selected_interval_width,
+        "tuning_mode": result.tuning_mode,
+    }
+
     st.session_state["forecast_result"] = result
-    st.session_state["forecast_inputs"] = {k: v for k, v in common.items()}
+    st.session_state["forecast_inputs"] = used_forecast_inputs
     st.session_state["forecast_source_mode"] = controls["source_mode"]
     scenario_summary = _build_phase_scenario_summary(controls["capacity_phases"])
     st.session_state["forecast_scenario_summary"] = scenario_summary
@@ -142,6 +257,11 @@ if controls["run"]:
         "source_mode": controls["source_mode"],
         "scenario_summary": scenario_summary,
         **common,
+        "tuning_mode": result.tuning_mode,
+        "changepoint_prior_scale": result.selected_changepoint_prior_scale,
+        "interval_width": result.selected_interval_width,
+        "tuning_primary_metric": result.tuning_primary_metric,
+        "tuning_primary_score": result.tuning_primary_score,
         "MAPE": float(result.performance_metrics.get("MAPE", float("nan"))),
         "MAE": float(result.performance_metrics.get("MAE", float("nan"))),
         "RMSE": float(result.performance_metrics.get("RMSE", float("nan"))),
@@ -150,6 +270,7 @@ if controls["run"]:
     hist = st.session_state["forecast_history"]
     hist.insert(0, entry)
     st.session_state["forecast_history"] = hist[:20]
+    st.session_state["forecast_results_section"] = "📉 Forecast"
 
 # If no stored result, prompt
 if "forecast_result" not in st.session_state:
@@ -186,11 +307,14 @@ rmse_label, rmse_icon = _score_label("RMSE", rmse_v, baseline)
 # --- Validation panel ---
 st.subheader("Forecast validation (backtesting)")
 st.markdown(
-    """These metrics are computed using **backtesting** (historical forecasts).  
-- **MAPE** = average % error (easier to compare across departments)  
-- **MAE** = average absolute error (in visit units)  
-- **RMSE** = like MAE but penalizes big misses more (in visit units)  
+    """These metrics are computed using **backtesting** on the model's **monthly** historical forecasts.  
+- **MAPE** = average % error for each forecasted month (easier to compare across departments)  
+- **MAE** = average absolute error in visit units for each forecasted month  
+- **RMSE** = like MAE but penalizes big monthly misses more (in visit units per forecasted month)  
 """
+)
+st.caption(
+    "This app forecasts monthly visit totals. Example: an MAE of 2.14 means the model is off by about 2.14 visits in a typical month, not 2.14 visits per quarter or per year."
 )
 
 c1, c2, c3 = st.columns(3)
@@ -206,33 +330,72 @@ if baseline and baseline > 0:
 
 st.caption(f"Departments included: {result.department_info}")
 
+if result.tuning_mode == "auto":
+    t1, t2, t3 = st.columns(3)
+    t1.metric(
+        "Auto-tuned CP",
+        (
+            f"{result.selected_changepoint_prior_scale:.2f}"
+            if result.selected_changepoint_prior_scale is not None
+            else "n/a"
+        ),
+    )
+    t2.metric(
+        "Auto-tuned Interval",
+        (
+            f"{result.selected_interval_width:.2f}"
+            if result.selected_interval_width is not None
+            else "n/a"
+        ),
+    )
+    tuning_metric_name = result.tuning_primary_metric or "Score"
+    t3.metric(
+        f"Auto-tune {tuning_metric_name}",
+        (
+            f"{result.tuning_primary_score:.4f}"
+            if result.tuning_primary_score is not None
+            else "n/a"
+        ),
+    )
+    if result.tuning_note:
+        st.caption(result.tuning_note)
+    if result.tuning_diagnostics_df is not None and not result.tuning_diagnostics_df.empty:
+        with st.expander("Auto-tune diagnostics", expanded=False):
+            st.dataframe(
+                _style_tuning_diagnostics_table(result.tuning_diagnostics_df),
+                use_container_width=True,
+            )
+
 
 st.markdown("---")
 st.subheader("How to interpret these metrics & charts")
 
 with st.expander(
-    "Metric glossary + quick interpretation (backtesting & CV)", expanded=True
+    "Metric glossary + quick interpretation (backtesting & CV)", expanded=False
 ):
     st.markdown(
         """**Backtesting metrics (computed on historical forecasts):**
 
-- **MAPE (Mean Absolute Percentage Error)**: average absolute % error.  
+- **MAPE (Mean Absolute Percentage Error)**: average absolute % error for each forecasted month.  
   - **Lower is better.** Rough heuristic: **<10% excellent**, **10–20% good**, **20–50% fair**, **>50% poor**.  
   - Watch out when actuals are near zero (MAPE can blow up).
 
-- **MAE (Mean Absolute Error)**: average absolute error in *visit units*.  
+- **MAE (Mean Absolute Error)**: average absolute error in *visit units per forecasted month*.  
   - **Lower is better.** Interpreting MAE depends on your volume scale.  
+  - Example: MAE = 2.14 means a typical monthly forecast miss of about 2.14 visits.
   - Helpful rule: compare MAE to the mean monthly volume (we show MAE/mean above).
 
-- **RMSE (Root Mean Squared Error)**: like MAE but penalizes large misses more.  
+- **RMSE (Root Mean Squared Error)**: like MAE but penalizes large monthly misses more.  
   - **Lower is better.** RMSE > MAE when you have occasional big errors (spikes).
+  - Units are also visits per forecasted month.
 
 **Prophet cross‑validation metrics (performance_metrics):**
 
-- **mse / rmse / mae**: error magnitude (units = visits).  
+- **mse / rmse / mae**: error magnitude for each forecasted month at a given horizon (units = visits per month).  
   - rmse penalizes big misses more than mae.
 
 - **mape / mdape**: percent-based errors (unitless).  
+  - These are also evaluated on monthly forecast points.
   - **mdape** is the median version (more robust to outliers).
 
 - **smape**: symmetric MAPE (tries to be more stable than MAPE when values are small).  
@@ -245,7 +408,7 @@ with st.expander(
 
 **What “good” looks like (practical):**
 - MAPE: aim for **<20%** for operational planning, **<10%** if you need tight staffing decisions.
-- MAE/RMSE: aim for error that is a small slice of typical monthly volume (e.g., **<10% of mean**).
+- MAE/RMSE: aim for monthly error that is a small slice of typical monthly volume (e.g., **<10% of mean**).
 - Coverage: aim close to your interval width (e.g., **~0.90** for 90% intervals).
 """
     )
@@ -262,10 +425,12 @@ with st.expander("Chart guide: what each graph is telling you"):
   - Otherwise, the app approximates a band using RMSE.
 
 - **Error bands (±MAE / ±RMSE)**: show typical miss size around the adjusted line.  
+  - These bands are based on monthly forecast error, so think of them as visits above/below a typical month-level prediction.
   - Use this to sanity-check whether the forecast is “tight enough” for your decision.
 
 - **Fiscal Summary**: aggregates monthly totals into fiscal years (Apr–Mar).  
   - Helpful for annual targets and capacity planning at a higher level.
+  - Important: the fiscal tables are aggregated views of monthly forecasts; the MAE/RMSE/MAPE validation metrics are still month-based.
 
 - **Prophet CV plots (metric vs horizon)**: how forecast error grows as you predict further out.  
   - You usually expect error to increase with horizon.  
@@ -273,19 +438,25 @@ with st.expander("Chart guide: what each graph is telling you"):
 """
     )
 
+result_sections = [
+    "📉 Forecast",
+    "📅 Future Table",
+    "🏛️ Fiscal Summary",
+    "🧾 Run History",
+    "📊 Prophet CV",
+    "🧩 Prophet Plots",
+]
+if "forecast_results_section" not in st.session_state:
+    st.session_state["forecast_results_section"] = result_sections[0]
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    [
-        "📉 Forecast",
-        "📅 Future Table",
-        "🏛️ Fiscal Summary",
-        "🧾 Run History",
-        "📊 Prophet CV",
-        "🧩 Prophet Plots",
-    ]
+selected_results_section = st.segmented_control(
+    "Results section",
+    options=result_sections,
+    key="forecast_results_section",
+    selection_mode="single",
 )
 
-with tab1:
+if selected_results_section == "📉 Forecast":
     ci_choice = st.radio(
         "Confidence interval",
         ["95% (≈ ±1.96·RMSE)", "68% (≈ ±1·RMSE)"],
@@ -299,6 +470,9 @@ with tab1:
         mae=mae_v,
         rmse=rmse_v,
         ci_mode=ci_mode_val,
+        source_interval_width=st.session_state.get("forecast_inputs", {}).get(
+            "interval_width"
+        ),
         phase_metadata=st.session_state.get("forecast_inputs", {}).get(
             "capacity_phases"
         ),
@@ -308,7 +482,7 @@ with tab1:
     else:
         st.plotly_chart(fig, use_container_width=True)
 
-with tab2:
+elif selected_results_section == "📅 Future Table":
     scenario_summary = st.session_state.get(
         "forecast_scenario_summary",
         _build_phase_scenario_summary(
@@ -325,7 +499,7 @@ with tab2:
         mime="text/csv",
     )
 
-with tab3:
+elif selected_results_section == "🏛️ Fiscal Summary":
     fiscal_summary_mode = st.radio(
         "Fiscal summary granularity",
         ["Fiscal Year", "Fiscal Quarter"],
@@ -334,6 +508,7 @@ with tab3:
     )
 
     selected_fiscal_summary = result.fiscal_summary
+    chart_fiscal_summary = selected_fiscal_summary
     selected_period_column = "Fiscal_Year"
     selected_export_filename = "fiscal_summary_year.csv"
 
@@ -364,17 +539,21 @@ with tab3:
             }
         )[["ds", "y"]]
 
-        selected_fiscal_summary = aggregate_summary_by_period(
+        chart_fiscal_summary = aggregate_summary_by_period(
             historical_dataframe,
             result.future_forecast_df,
             period="quarter",
         )
+        selected_fiscal_summary = append_fiscal_year_totals(chart_fiscal_summary)
         selected_period_column = "Fiscal_Period_Label"
         selected_export_filename = "fiscal_summary_quarter.csv"
 
-    st.dataframe(selected_fiscal_summary, use_container_width=True)
+    st.dataframe(
+        _style_fiscal_summary_table(selected_fiscal_summary),
+        use_container_width=True,
+    )
     fig2 = fiscal_bar_chart(
-        selected_fiscal_summary, period_column=selected_period_column
+        chart_fiscal_summary, period_column=selected_period_column
     )
     if fig2 is not None:
         st.plotly_chart(fig2, use_container_width=True)
@@ -386,7 +565,7 @@ with tab3:
         mime="text/csv",
     )
 
-with tab4:
+elif selected_results_section == "🧾 Run History":
     st.subheader("Forecast run history (last 20)")
     if not st.session_state["forecast_history"]:
         st.info("No runs yet.")
@@ -400,8 +579,7 @@ with tab4:
             mime="text/csv",
         )
 
-
-with tab5:
+elif selected_results_section == "📊 Prophet CV":
     st.subheader("Prophet cross-validation (prophet.diagnostics)")
     st.caption(
         "Cross-validation simulates forecasting from multiple cutoffs to estimate error across different horizons."
@@ -426,7 +604,19 @@ with tab5:
         st.caption(
             "Prophet-native cross-validation metrics (performance_metrics output)."
         )
-        st.dataframe(cv_metrics.head(50), use_container_width=True)
+        cv_display_df = add_prophet_cv_indicators(
+            cv_metrics.head(50),
+            interval_width=st.session_state.get("forecast_inputs", {}).get(
+                "interval_width"
+            ),
+        )
+        st.dataframe(_style_prophet_cv_table(cv_display_df), use_container_width=True)
+        st.caption(
+            "Indicators: coverage within +/-0.03 of interval width = On target, "
+            "+/-0.08 = Watch; RMSE/MAE <= 1.15 = Uniform, <= 1.40 = Some spikes, "
+            "> 1.40 = Big misses; MAPE/MDAPE <= 1.15 = Aligned, <= 1.50 = Some outliers, "
+            "> 1.50 = MDAPE more reliable."
+        )
 
         # Plot common metrics vs horizon
         import plotly.express as px
@@ -469,7 +659,7 @@ with tab5:
                 mime="text/csv",
             )
 
-with tab6:
+elif selected_results_section == "🧩 Prophet Plots":
     st.subheader("Prophet plots (forecast + components)")
     prophet_fc = getattr(result, "prophet_forecast_df", None)
     if prophet_fc is None or getattr(prophet_fc, "empty", True):
