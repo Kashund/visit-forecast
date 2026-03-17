@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 
 from visit_forecast import forecast_visits
+from visit_forecast.fiscal import aggregate_summary_by_period
 from components.sidebar import sidebar_controls
 from components.charts import forecast_line_chart, fiscal_bar_chart
 
@@ -325,15 +326,63 @@ with tab2:
     )
 
 with tab3:
-    st.dataframe(result.fiscal_summary, use_container_width=True)
-    fig2 = fiscal_bar_chart(result.fiscal_summary)
+    fiscal_summary_mode = st.radio(
+        "Fiscal summary granularity",
+        ["Fiscal Year", "Fiscal Quarter"],
+        horizontal=True,
+        key="fiscal_summary_granularity",
+    )
+
+    selected_fiscal_summary = result.fiscal_summary
+    selected_period_column = "Fiscal_Year"
+    selected_export_filename = "fiscal_summary_year.csv"
+
+    if fiscal_summary_mode == "Fiscal Quarter":
+        series_dataframe = _timeseries_to_pd(result.series).reset_index()
+        datetime_column_candidates = [
+            column_name
+            for column_name in ["ds", "time", "date", "index"]
+            if column_name in series_dataframe.columns
+        ]
+        if not datetime_column_candidates:
+            st.error("Could not identify a datetime column for fiscal aggregation.")
+            st.stop()
+
+        value_column_candidates = [
+            column_name
+            for column_name in series_dataframe.columns
+            if column_name not in datetime_column_candidates
+        ]
+        if not value_column_candidates:
+            st.error("Could not identify a value column for fiscal aggregation.")
+            st.stop()
+
+        historical_dataframe = series_dataframe.rename(
+            columns={
+                datetime_column_candidates[0]: "ds",
+                value_column_candidates[0]: "y",
+            }
+        )[["ds", "y"]]
+
+        selected_fiscal_summary = aggregate_summary_by_period(
+            historical_dataframe,
+            result.future_forecast_df,
+            period="quarter",
+        )
+        selected_period_column = "Fiscal_Period_Label"
+        selected_export_filename = "fiscal_summary_quarter.csv"
+
+    st.dataframe(selected_fiscal_summary, use_container_width=True)
+    fig2 = fiscal_bar_chart(
+        selected_fiscal_summary, period_column=selected_period_column
+    )
     if fig2 is not None:
         st.plotly_chart(fig2, use_container_width=True)
 
     st.download_button(
         "Download fiscal summary CSV",
-        data=result.fiscal_summary.to_csv(index=False).encode("utf-8"),
-        file_name="fiscal_summary.csv",
+        data=selected_fiscal_summary.to_csv(index=False).encode("utf-8"),
+        file_name=selected_export_filename,
         mime="text/csv",
     )
 
