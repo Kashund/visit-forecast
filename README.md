@@ -27,6 +27,13 @@ pip install -e .
 streamlit run apps/streamlit/Home.py
 ```
 
+## Quick launch shortcut (start + open browser)
+```bash
+python scripts/launch_streamlit_app.py
+```
+
+This helper starts Streamlit and automatically opens `http://127.0.0.1:8501` in your default web browser.
+
 ## Use from Python / notebooks
 ```python
 from visit_forecast import forecast_visits
