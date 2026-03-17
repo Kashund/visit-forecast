@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import importlib.util
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import webbrowser
 from pathlib import Path
+from typing import Sequence
 
 
 def wait_for_port(host: str, port: int, timeout_seconds: int) -> bool:
@@ -23,6 +26,19 @@ def wait_for_port(host: str, port: int, timeout_seconds: int) -> bool:
     return False
 
 
+def has_streamlit_module(python_executable: str) -> bool:
+    """Return True when Streamlit is importable in this interpreter."""
+    if python_executable != sys.executable:
+        return False
+    return importlib.util.find_spec("streamlit") is not None
+
+
+def build_streamlit_launch_command(
+    app_file_path: Path, host: str, port: int
+) -> Sequence[str] | None:
+    """Build the best available launch command for Streamlit."""
+    if has_streamlit_module(sys.executable):
+        return [
 def main() -> int:
     repository_root = Path(__file__).resolve().parents[1]
     app_file_path = repository_root / "apps" / "streamlit" / "Home.py"
@@ -41,6 +57,43 @@ def main() -> int:
             host,
             "--server.port",
             str(port),
+        ]
+
+    streamlit_executable = shutil.which("streamlit")
+    if streamlit_executable:
+        return [
+            streamlit_executable,
+            "run",
+            str(app_file_path),
+            "--server.address",
+            host,
+            "--server.port",
+            str(port),
+        ]
+
+    return None
+
+
+def main() -> int:
+    repository_root = Path(__file__).resolve().parents[1]
+    app_file_path = repository_root / "apps" / "streamlit" / "Home.py"
+    host = "127.0.0.1"
+    port = 8501
+    application_url = f"http://{host}:{port}"
+
+    launch_command = build_streamlit_launch_command(app_file_path, host, port)
+    if launch_command is None:
+        print(
+            "Could not find Streamlit in this Python interpreter or on PATH.\n"
+            "Activate your project environment, then install dependencies and rerun:\n"
+            "  pip install -e .\n"
+            "Then run:\n"
+            "  python scripts/launch_streamlit_app.py",
+            file=sys.stderr,
+        )
+        return 1
+
+    streamlit_process = subprocess.Popen(launch_command, cwd=repository_root)
         ],
         cwd=repository_root,
     )

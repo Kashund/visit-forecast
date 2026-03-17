@@ -34,6 +34,12 @@ python scripts/launch_streamlit_app.py
 
 This helper starts Streamlit and automatically opens `http://127.0.0.1:8501` in your default web browser.
 
+If you see `No module named streamlit`, use the same Python environment where this project is installed:
+```bash
+python -m pip install -e .
+python scripts/launch_streamlit_app.py
+```
+
 ## Use from Python / notebooks
 ```python
 from visit_forecast import forecast_visits
