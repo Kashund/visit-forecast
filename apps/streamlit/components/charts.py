@@ -205,18 +205,45 @@ def forecast_line_chart(
     return fig
 
 
-def fiscal_bar_chart(fiscal_df: pd.DataFrame):
+def fiscal_bar_chart(
+    fiscal_df: pd.DataFrame,
+    period_column: str = "Fiscal_Year",
+    title_text: str | None = None,
+):
     if fiscal_df is None or fiscal_df.empty:
         return None
 
     import plotly.express as px
 
+    chart_data = fiscal_df.copy()
+    category_orders = None
+
+    if period_column == "Fiscal_Period_Label" and {
+        "Fiscal_Year",
+        "Fiscal_Quarter",
+        "Fiscal_Period_Label",
+    }.issubset(chart_data.columns):
+        chart_data = chart_data.sort_values(
+            ["Fiscal_Year", "Fiscal_Quarter"]
+        ).reset_index(drop=True)
+        category_orders = {
+            "Fiscal_Period_Label": chart_data["Fiscal_Period_Label"].tolist()
+        }
+
+    if title_text is None:
+        title_text = (
+            "Fiscal Quarter Aggregates"
+            if period_column == "Fiscal_Period_Label"
+            else "Fiscal Year Aggregates"
+        )
+
     fig = px.bar(
-        fiscal_df,
-        x="Fiscal_Year",
+        chart_data,
+        x=period_column,
         y=["Historical_Visits", "Forecast_Original", "Forecast_Adjusted"],
         barmode="group",
-        title="Fiscal Year Aggregates",
+        title=title_text,
+        category_orders=category_orders,
     )
     fig.update_layout(legend_title_text="Series")
     return fig
