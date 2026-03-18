@@ -15,6 +15,7 @@ from visit_forecast.fiscal import (
 )
 from components.sidebar import sidebar_controls
 from components.charts import forecast_line_chart, fiscal_bar_chart
+from state import apply_forecast_run_to_session
 
 # Optional Prophet diagnostics helpers
 try:
@@ -61,6 +62,17 @@ def _score_label(metric_name: str, value: float, baseline: float | None = None):
     if norm < 0.20:
         return ("Fair", "🟨")
     return ("Poor", "🟥")
+
+
+def _coverage_check(value: float, target_coverage: float) -> str:
+    if pd.isna(value):
+        return "Unavailable"
+    gap = abs(float(value) - float(target_coverage))
+    if gap <= 0.03:
+        return "On target"
+    if gap <= 0.08:
+        return "Watch"
+    return "Off target"
 
 
 def _build_phase_scenario_summary(capacity_phases: list[dict] | None) -> str:
@@ -167,14 +179,16 @@ def _style_prophet_cv_table(cv_display_df: pd.DataFrame):
 
 def _style_tuning_diagnostics_table(tuning_df: pd.DataFrame):
     display_df = tuning_df.copy()
-    styler = display_df.style.format(
-        {
-            "candidate_value": "{:.2f}",
-            "primary_score_value": "{:.4f}",
-            "tie_breaker_value": "{:.4f}",
-        },
-        na_rep="n/a",
-    )
+    formatters = {
+        "primary_score_value": "{:.4f}",
+        "tie_breaker_value": "{:.4f}",
+    }
+    if "candidate_value" in display_df.columns and pd.api.types.is_numeric_dtype(
+        display_df["candidate_value"]
+    ):
+        formatters["candidate_value"] = "{:.2f}"
+
+    styler = display_df.style.format(formatters, na_rep="n/a")
 
     def _row_style(row: pd.Series):
         selected_style = (
@@ -185,6 +199,36 @@ def _style_tuning_diagnostics_table(tuning_df: pd.DataFrame):
         return [selected_style] * len(row)
 
     return styler.apply(_row_style, axis=1)
+
+
+def _style_interval_validation_table(interval_df: pd.DataFrame):
+    display_df = interval_df.copy()
+
+    numeric_formatters = {
+        column_name: "{:.4f}"
+        for column_name in display_df.columns
+        if pd.api.types.is_numeric_dtype(display_df[column_name])
+        and column_name not in {"horizon_step", "Horizon_Days", "n_calibration_forecasts"}
+    }
+    for integer_column in ["horizon_step", "Horizon_Days", "n_calibration_forecasts"]:
+        if integer_column in display_df.columns:
+            numeric_formatters[integer_column] = "{:.0f}"
+
+    status_styles = {
+        "On target": "background-color: rgba(46, 125, 50, 0.18); font-weight: 600;",
+        "Watch": "background-color: rgba(245, 124, 0, 0.18); font-weight: 600;",
+        "Off target": "background-color: rgba(198, 40, 40, 0.18); font-weight: 600;",
+        "Unavailable": "background-color: rgba(96, 125, 139, 0.16); font-weight: 600;",
+    }
+
+    styler = display_df.style.format(numeric_formatters, na_rep="n/a")
+    for column_name in ["Coverage_Check"]:
+        if column_name in display_df.columns:
+            styler = styler.map(
+                lambda value: status_styles.get(str(value), ""),
+                subset=[column_name],
+            )
+    return styler
 
 
 # Initialize history store
@@ -223,7 +267,8 @@ common = dict(
     exclude_departments=controls["exclude_departments"] or None,
     capacity_phases=controls["capacity_phases"],
     changepoint_prior_scale=float(controls["changepoint_prior_scale"]),
-    interval_width=float(controls["interval_width"]),
+    target_coverage=float(controls["target_coverage"]),
+    uncertainty_method=str(controls["uncertainty_method"]),
     tuning_mode=str(controls["tuning_mode"]),
 )
 
@@ -238,39 +283,15 @@ if controls["run"]:
                 st.stop()
             result = forecast_visits(df=df_preview, **common)
 
-    used_forecast_inputs = {
-        **common,
-        "changepoint_prior_scale": result.selected_changepoint_prior_scale,
-        "interval_width": result.selected_interval_width,
-        "tuning_mode": result.tuning_mode,
-    }
-
-    st.session_state["forecast_result"] = result
-    st.session_state["forecast_inputs"] = used_forecast_inputs
-    st.session_state["forecast_source_mode"] = controls["source_mode"]
     scenario_summary = _build_phase_scenario_summary(controls["capacity_phases"])
-    st.session_state["forecast_scenario_summary"] = scenario_summary
-
-    # Append to history (keep last 20)
-    entry = {
-        "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source_mode": controls["source_mode"],
-        "scenario_summary": scenario_summary,
-        **common,
-        "tuning_mode": result.tuning_mode,
-        "changepoint_prior_scale": result.selected_changepoint_prior_scale,
-        "interval_width": result.selected_interval_width,
-        "tuning_primary_metric": result.tuning_primary_metric,
-        "tuning_primary_score": result.tuning_primary_score,
-        "MAPE": float(result.performance_metrics.get("MAPE", float("nan"))),
-        "MAE": float(result.performance_metrics.get("MAE", float("nan"))),
-        "RMSE": float(result.performance_metrics.get("RMSE", float("nan"))),
-        "departments_included": result.department_info,
-    }
-    hist = st.session_state["forecast_history"]
-    hist.insert(0, entry)
-    st.session_state["forecast_history"] = hist[:20]
-    st.session_state["forecast_results_section"] = "📉 Forecast"
+    apply_forecast_run_to_session(
+        st.session_state,
+        common=common,
+        result=result,
+        source_mode=controls["source_mode"],
+        scenario_summary=scenario_summary,
+        run_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    )
 
 # If no stored result, prompt
 if "forecast_result" not in st.session_state:
@@ -341,7 +362,7 @@ if result.tuning_mode == "auto":
         ),
     )
     t2.metric(
-        "Auto-tuned Interval",
+        "Coverage / Interval",
         (
             f"{result.selected_interval_width:.2f}"
             if result.selected_interval_width is not None
@@ -357,15 +378,114 @@ if result.tuning_mode == "auto":
             else "n/a"
         ),
     )
-    if result.tuning_note:
-        st.caption(result.tuning_note)
-    if result.tuning_diagnostics_df is not None and not result.tuning_diagnostics_df.empty:
-        with st.expander("Auto-tune diagnostics", expanded=False):
-            st.dataframe(
-                _style_tuning_diagnostics_table(result.tuning_diagnostics_df),
-                use_container_width=True,
-            )
 
+if result.tuning_note:
+    st.caption(result.tuning_note)
+if result.tuning_diagnostics_df is not None and not result.tuning_diagnostics_df.empty:
+    with st.expander("Auto-tune diagnostics", expanded=False):
+        st.dataframe(
+            _style_tuning_diagnostics_table(result.tuning_diagnostics_df),
+            use_container_width=True,
+        )
+
+st.markdown("---")
+st.subheader("Interval validation")
+
+interval_summary = getattr(result, "interval_summary_metrics", {}) or {}
+interval_diagnostics_df = getattr(result, "interval_diagnostics_df", None)
+interval_source = str(interval_summary.get("interval_source_used", result.uncertainty_method))
+target_coverage = float(interval_summary.get("target_coverage", result.target_coverage))
+empirical_coverage = interval_summary.get("empirical_coverage_overall", float("nan"))
+coverage_status = _coverage_check(empirical_coverage, target_coverage)
+requested_uncertainty_method = getattr(
+    result,
+    "requested_uncertainty_method",
+    interval_summary.get("requested_uncertainty_method", result.uncertainty_method),
+)
+
+i1, i2, i3, i4 = st.columns(4)
+i1.metric("Interval source", interval_source.capitalize())
+i2.metric("Target coverage", f"{target_coverage:.2%}")
+i3.metric(
+    "Empirical coverage",
+    f"{empirical_coverage:.2%}" if pd.notna(empirical_coverage) else "n/a",
+)
+i4.metric("Coverage status", coverage_status)
+
+if requested_uncertainty_method != result.uncertainty_method:
+    st.caption(
+        f"Requested uncertainty method: {requested_uncertainty_method}  •  "
+        f"Selected for this run: {result.uncertainty_method}"
+    )
+
+avg_interval_width = interval_summary.get("avg_interval_width")
+median_interval_width = interval_summary.get("median_interval_width")
+interval_width_over_mean_actual = interval_summary.get("interval_width_over_mean_actual")
+fallback_used = bool(interval_summary.get("fallback_used", False))
+n_calibration_forecasts = int(interval_summary.get("n_calibration_forecasts", 0) or 0)
+
+st.caption(
+    f"Calibration rows: {n_calibration_forecasts}  •  "
+    f"Average interval width: {avg_interval_width:.2f}" if pd.notna(avg_interval_width) else
+    f"Calibration rows: {n_calibration_forecasts}  •  Average interval width: n/a"
+)
+st.caption(
+    f"Median interval width: {median_interval_width:.2f}  •  "
+    f"Width / mean actual: {interval_width_over_mean_actual:.2%}"
+    if pd.notna(median_interval_width) and pd.notna(interval_width_over_mean_actual)
+    else "Median interval width: n/a  •  Width / mean actual: n/a"
+)
+if interval_source == "conformal":
+    st.caption(
+        "Conformal intervals are calibrated from rolling forecast residuals. They target empirical coverage under stable historical error behavior."
+    )
+    if fallback_used:
+        st.caption(
+            "Fallback used for at least one horizon because there were fewer than 8 calibration residuals for that step."
+        )
+else:
+    st.caption(
+        "Prophet interval coverage is summarized from Prophet cross-validation metrics. Detailed Prophet-native diagnostics remain in the CV section below."
+    )
+
+if interval_diagnostics_df is not None and not interval_diagnostics_df.empty:
+    display_interval_df = interval_diagnostics_df.copy()
+    if "empirical_coverage" in display_interval_df.columns:
+        display_interval_df["Coverage_Check"] = display_interval_df[
+            "empirical_coverage"
+        ].map(lambda value: _coverage_check(value, target_coverage))
+    preferred_interval_columns = [
+        "horizon_step",
+        "Horizon_Days",
+        "horizon",
+        "empirical_coverage",
+        "target_coverage",
+        "Coverage_Check",
+        "avg_interval_width",
+        "median_interval_width",
+        "n_calibration_forecasts",
+        "fallback_used",
+    ]
+    ordered_interval_columns = [
+        column_name
+        for column_name in preferred_interval_columns
+        if column_name in display_interval_df.columns
+    ]
+    ordered_interval_columns.extend(
+        [
+            column_name
+            for column_name in display_interval_df.columns
+            if column_name not in ordered_interval_columns
+        ]
+    )
+    st.dataframe(
+        _style_interval_validation_table(
+            display_interval_df[ordered_interval_columns]
+        ),
+        use_container_width=True,
+    )
+else:
+    st.info("Interval validation details are not available for this run.")
 
 st.markdown("---")
 st.subheader("How to interpret these metrics & charts")
@@ -402,14 +522,23 @@ with st.expander(
   - **Lower is better.**
 
 - **coverage**: fraction of actuals that fall inside Prophet’s uncertainty interval.  
-  - If interval_width=0.90, *ideal* long-run coverage is near **0.90**.  
+  - If target coverage is 0.90, *ideal* long-run coverage is near **0.90**.  
   - Coverage much **lower** ⇒ intervals too narrow / underestimating uncertainty.  
   - Coverage much **higher** ⇒ intervals too wide / overly conservative.
+
+**Interval types in this app:**
+
+- **Prophet interval**: model-based uncertainty bounds from Prophet.  
+  - Best interpreted with the Prophet CV section below.
+
+- **Conformal interval**: residual-calibrated bounds from rolling historical forecasts.  
+  - Best interpreted with the **Interval validation** panel above.
+  - These intervals aim to match the selected target coverage empirically, assuming future errors behave similarly to recent historical errors.
 
 **What “good” looks like (practical):**
 - MAPE: aim for **<20%** for operational planning, **<10%** if you need tight staffing decisions.
 - MAE/RMSE: aim for monthly error that is a small slice of typical monthly volume (e.g., **<10% of mean**).
-- Coverage: aim close to your interval width (e.g., **~0.90** for 90% intervals).
+- Coverage: aim close to your target coverage (e.g., **~0.90** for 90% intervals).
 """
     )
 
@@ -420,13 +549,14 @@ with st.expander("Chart guide: what each graph is telling you"):
   - **Adjusted** = capacity add/loss applied only in the selected month window.  
   - **Shaded window** highlights months where the adjustment was applied.
 
-- **Confidence interval band**: uncertainty around the adjusted forecast.  
-  - If Prophet interval bounds exist, the band reflects **interval_width**.  
-  - Otherwise, the app approximates a band using RMSE.
+- **Forecast interval band**: uncertainty around the adjusted forecast.  
+  - In **Prophet interval** mode, the band is model-based.  
+  - In **Conformal calibrated** mode, the band is built from rolling forecast residuals to target the selected coverage.  
+  - If no explicit interval is available, the chart falls back to an RMSE-based approximation.
 
-- **Error bands (±MAE / ±RMSE)**: show typical miss size around the adjusted line.  
+- **Historical error bands (±MAE / ±RMSE)**: show typical miss size around the adjusted line.  
   - These bands are based on monthly forecast error, so think of them as visits above/below a typical month-level prediction.
-  - Use this to sanity-check whether the forecast is “tight enough” for your decision.
+  - Use these as context, not as calibrated coverage intervals.
 
 - **Fiscal Summary**: aggregates monthly totals into fiscal years (Apr–Mar).  
   - Helpful for annual targets and capacity planning at a higher level.
@@ -457,22 +587,17 @@ selected_results_section = st.segmented_control(
 )
 
 if selected_results_section == "📉 Forecast":
-    ci_choice = st.radio(
-        "Confidence interval",
-        ["95% (≈ ±1.96·RMSE)", "68% (≈ ±1·RMSE)"],
-        horizontal=True,
-        key="ci_choice",
+    active_interval_source = (
+        (getattr(result, "interval_summary_metrics", {}) or {}).get(
+            "interval_source_used", result.uncertainty_method
+        )
     )
-    ci_mode_val = "rmse_95" if ci_choice.startswith("95%") else "rmse_68"
-
     fig = forecast_line_chart(
         result.future_forecast_df,
         mae=mae_v,
         rmse=rmse_v,
-        ci_mode=ci_mode_val,
-        source_interval_width=st.session_state.get("forecast_inputs", {}).get(
-            "interval_width"
-        ),
+        target_coverage=result.target_coverage,
+        interval_source=str(active_interval_source),
         phase_metadata=st.session_state.get("forecast_inputs", {}).get(
             "capacity_phases"
         ),
@@ -587,7 +712,7 @@ elif selected_results_section == "📊 Prophet CV":
     with st.expander("Interpretation tips (CV)", expanded=False):
         st.markdown(
             "- **Horizon** = how far ahead the model is predicting. Errors usually increase with horizon.\n"
-            "- **coverage** should be close to your interval width (e.g., ~0.90 for 90% intervals).\n"
+            "- **coverage** should be close to your target coverage (e.g., ~0.90 for 90% intervals).\n"
             "- If **rmse** is close to **mae**, errors are fairly uniform. If rmse >> mae, you have big misses.\n"
             "- Use **mdape** when outliers or spikes distort mape.\n"
         )
@@ -607,12 +732,12 @@ elif selected_results_section == "📊 Prophet CV":
         cv_display_df = add_prophet_cv_indicators(
             cv_metrics.head(50),
             interval_width=st.session_state.get("forecast_inputs", {}).get(
-                "interval_width"
+                "target_coverage"
             ),
         )
         st.dataframe(_style_prophet_cv_table(cv_display_df), use_container_width=True)
         st.caption(
-            "Indicators: coverage within +/-0.03 of interval width = On target, "
+            "Indicators: coverage within +/-0.03 of target coverage = On target, "
             "+/-0.08 = Watch; RMSE/MAE <= 1.15 = Uniform, <= 1.40 = Some spikes, "
             "> 1.40 = Big misses; MAPE/MDAPE <= 1.15 = Aligned, <= 1.50 = Some outliers, "
             "> 1.50 = MDAPE more reliable."

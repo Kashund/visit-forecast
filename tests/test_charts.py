@@ -20,7 +20,7 @@ charts_module_spec.loader.exec_module(charts_module)
 forecast_line_chart = charts_module.forecast_line_chart
 
 
-def test_forecast_line_chart_rescales_prophet_interval_by_selected_confidence():
+def test_forecast_line_chart_labels_active_interval_source_and_coverage():
     future_df = pd.DataFrame(
         {
             "ds": pd.to_datetime(["2026-01-01", "2026-02-01"]),
@@ -33,19 +33,10 @@ def test_forecast_line_chart_rescales_prophet_interval_by_selected_confidence():
 
     fig_95 = forecast_line_chart(
         future_df,
-        ci_mode="rmse_95",
-        source_interval_width=0.90,
-    )
-    fig_68 = forecast_line_chart(
-        future_df,
-        ci_mode="rmse_68",
-        source_interval_width=0.90,
+        target_coverage=0.90,
+        interval_source="conformal",
     )
 
-    ci_upper_95 = list(fig_95.data[0].y)
-    ci_upper_68 = list(fig_68.data[0].y)
-
-    assert fig_95.data[0].name == "CI upper (95%)"
-    assert fig_68.data[0].name == "CI upper (68%)"
-    assert ci_upper_95 != ci_upper_68
-    assert ci_upper_95[0] > ci_upper_68[0]
+    assert fig_95.data[0].name == "Conformal interval upper (90%)"
+    assert fig_95.data[1].name == "Conformal interval lower (90%)"
+    assert list(fig_95.data[0].y) == [110.0, 122.0]

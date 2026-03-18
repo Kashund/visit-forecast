@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import pandas as pd
 import streamlit as st
 from io import StringIO
@@ -15,6 +16,61 @@ def _read_uploaded(file) -> pd.DataFrame:
 
 def _read_pasted_csv(text: str) -> pd.DataFrame:
     return pd.read_csv(StringIO(text))
+
+
+def _infer_timeframe_bounds(df_preview: pd.DataFrame | None) -> tuple[str | None, str | None]:
+    if df_preview is None or df_preview.empty or "Date" not in df_preview.columns:
+        return None, None
+
+    date_series = pd.to_datetime(df_preview["Date"], errors="coerce").dropna()
+    if date_series.empty:
+        return None, None
+
+    return (
+        date_series.min().strftime("%Y-%m-%d"),
+        date_series.max().strftime("%Y-%m-%d"),
+    )
+
+
+def _source_signature(
+    source_mode: str,
+    uploaded,
+    pasted_text: str | None,
+    df_preview: pd.DataFrame | None,
+) -> str | None:
+    detected_start, detected_end = _infer_timeframe_bounds(df_preview)
+    if source_mode == "Upload file" and uploaded is not None:
+        return (
+            f"upload:{getattr(uploaded, 'name', '')}:{detected_start}:{detected_end}:"
+            f"{len(df_preview) if df_preview is not None else 0}"
+        )
+
+    if source_mode == "Paste values (CSV)" and pasted_text and pasted_text.strip():
+        digest = hashlib.sha1(pasted_text.strip().encode("utf-8")).hexdigest()
+        return f"paste:{digest}:{detected_start}:{detected_end}"
+
+    return None
+
+
+def _sync_timeframe_defaults(
+    session_state,
+    *,
+    source_mode: str,
+    uploaded,
+    pasted_text: str | None,
+    df_preview: pd.DataFrame | None,
+) -> None:
+    detected_start, detected_end = _infer_timeframe_bounds(df_preview)
+    signature = _source_signature(source_mode, uploaded, pasted_text, df_preview)
+    if signature is None or detected_start is None or detected_end is None:
+        return
+
+    if session_state.get("_timeframe_source_signature") == signature:
+        return
+
+    session_state["start"] = detected_start
+    session_state["end"] = detected_end
+    session_state["_timeframe_source_signature"] = signature
 
 
 def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
@@ -61,6 +117,14 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             "Synthetic data includes: Cardiology, Oncology, Neurology (monthly)."
         )
 
+    _sync_timeframe_defaults(
+        st.session_state,
+        source_mode=source_mode,
+        uploaded=uploaded,
+        pasted_text=pasted_text,
+        df_preview=df_preview,
+    )
+
     st.sidebar.divider()
 
     st.sidebar.markdown("**Time window**")
@@ -96,11 +160,10 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     default_month_range = (1, default_end)
 
     for phase_number in range(1, 5):
-        is_first_phase = phase_number == 1
-        with st.sidebar.expander(f"Phase {phase_number}", expanded=is_first_phase):
+        with st.sidebar.expander(f"Phase {phase_number}", expanded=False):
             phase_enabled = st.checkbox(
                 "Enabled",
-                value=is_first_phase,
+                value=False,
                 key=f"phase_{phase_number}_enabled",
             )
 
@@ -145,11 +208,40 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             )
 
     st.sidebar.divider()
+    st.sidebar.markdown("**Uncertainty**")
+
+    uncertainty_method_label = st.sidebar.radio(
+        "Uncertainty method",
+        ["Auto-select", "Prophet interval", "Conformal calibrated"],
+        horizontal=True,
+        key="uncertainty_method",
+        help="Auto-select compares Prophet and conformal interval validation. Prophet interval uses model-based bounds. Conformal calibrated uses rolling forecast residuals to calibrate empirical coverage.",
+    )
+    if uncertainty_method_label == "Conformal calibrated":
+        uncertainty_method = "conformal"
+    elif uncertainty_method_label == "Auto-select":
+        uncertainty_method = "auto"
+    else:
+        uncertainty_method = "prophet"
+
+    target_coverage = float(
+        st.sidebar.slider(
+            "Target coverage",
+            0.50,
+            0.99,
+            0.90,
+            key="target_coverage",
+            help="Desired interval coverage. In Prophet mode this is the Prophet interval width; in conformal mode it is the empirical target coverage.",
+        )
+    )
+
+    st.sidebar.divider()
     st.sidebar.markdown("**Model tuning (advanced)**")
 
     parameter_selection_mode = st.sidebar.radio(
         "Parameter selection",
-        ["Manual", "Auto-tune"],
+        ["Auto-tune", "Manual"],
+        index=0,
         horizontal=True,
         key="parameter_selection_mode",
         help="Manual uses the sliders below. Auto-tune searches a moderate candidate set for this run.",
@@ -159,8 +251,9 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     if tuning_mode == "auto":
         st.sidebar.caption(
             "Auto-tune searches changepoint prior scale "
-            "[0.01, 0.03, 0.05, 0.10, 0.20] by balancing MAPE and RMSE, "
-            "and interval width [0.80, 0.85, 0.90, 0.95] by coverage calibration."
+            "[0.01, 0.03, 0.05, 0.10, 0.20] by balancing MAPE and RMSE. "
+            "If Uncertainty method is Auto-select, the app performs a joint search across changepoint and uncertainty method. "
+            "If Uncertainty method is set manually, the current interval / target coverage input is preserved for the run."
         )
 
     changepoint_prior_scale = float(
@@ -171,17 +264,6 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.05,
             key="cp",
             help="Higher values allow the trend to change more aggressively (more flexible, higher overfit risk).",
-            disabled=tuning_mode == "auto",
-        )
-    )
-    interval_width = float(
-        st.sidebar.slider(
-            "Interval width",
-            0.50,
-            0.99,
-            0.90,
-            key="iw",
-            help="Uncertainty interval width used by Prophet (e.g., 0.90 = 90% interval).",
             disabled=tuning_mode == "auto",
         )
     )
@@ -228,7 +310,9 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "exclude_departments": exclude_departments,
         "capacity_phases": capacity_phases,
         "changepoint_prior_scale": changepoint_prior_scale,
-        "interval_width": interval_width,
+        "target_coverage": target_coverage,
+        "interval_width": target_coverage,
+        "uncertainty_method": uncertainty_method,
         "tuning_mode": tuning_mode,
         "run": run,
     }

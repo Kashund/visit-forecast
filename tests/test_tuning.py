@@ -1,7 +1,11 @@
 import pandas as pd
 
 from visit_forecast import service
-from visit_forecast.tuning import TuningSelection, select_prophet_hyperparameters
+from visit_forecast.tuning import (
+    TuningSelection,
+    select_joint_forecast_configuration,
+    select_prophet_hyperparameters,
+)
 
 
 class DummyModel:
@@ -131,6 +135,147 @@ def test_select_prophet_hyperparameters_records_interval_width_fallback_when_cv_
     assert result.interval_width == 0.90
     assert result.note is not None
     assert "fallback interval_width=0.90" in result.note
+
+
+def test_select_prophet_hyperparameters_skips_interval_width_tuning_for_conformal_mode(
+    monkeypatch,
+):
+    def fake_fit_and_forecast(
+        df_prepared, forecast_periods, changepoint_prior_scale, interval_width
+    ):
+        return object(), object(), DummyModel(changepoint_prior_scale, interval_width)
+
+    def fake_backtest(model, series, forecast_horizon, start, stride):
+        return {"MAPE": 10.0, "MAE": 2.0, "RMSE": 4.0}
+
+    monkeypatch.setattr("visit_forecast.tuning.fit_and_forecast", fake_fit_and_forecast)
+    monkeypatch.setattr("visit_forecast.tuning.backtest", fake_backtest)
+
+    result = select_prophet_hyperparameters(
+        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        forecast_periods=3,
+        tune_interval_width=False,
+        fixed_interval_width=0.92,
+    )
+
+    assert result.interval_width == 0.92
+    assert result.note is not None
+    assert "fixed interval / target coverage" in result.note.lower()
+    assert (
+        result.diagnostics_df["parameter_family"] == "interval_width"
+    ).any()
+
+
+def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertainty(
+    monkeypatch,
+):
+    prophet_coverage_by_cp = {
+        0.03: 0.70,
+        0.05: 0.79,
+    }
+    conformal_summary_by_cp = {
+        0.03: {
+            "empirical_coverage_overall": 0.87,
+            "empirical_coverage_by_horizon": {1: 0.87},
+            "avg_interval_width": 14.0,
+            "median_interval_width": 14.0,
+            "interval_width_over_mean_actual": 0.12,
+            "n_calibration_forecasts": 12,
+            "fallback_used": False,
+        },
+        0.05: {
+            "empirical_coverage_overall": 0.90,
+            "empirical_coverage_by_horizon": {1: 0.90},
+            "avg_interval_width": 13.0,
+            "median_interval_width": 13.0,
+            "interval_width_over_mean_actual": 0.10,
+            "n_calibration_forecasts": 12,
+            "fallback_used": False,
+        },
+    }
+
+    class DummySeries:
+        pass
+
+    class DummyForecast:
+        def pd_dataframe(self):
+            return pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-04-01"]),
+                    "y": [130.0],
+                }
+            )
+
+    class DummyModel:
+        def __init__(self, cp: float, iw: float) -> None:
+            self.changepoint_prior_scale = cp
+            self.interval_width = iw
+
+    def fake_prophet_cv_metrics(model, initial, period, horizon):
+        return (
+            pd.DataFrame(),
+            pd.DataFrame(
+                {
+                    "horizon": pd.to_timedelta(["30 days"]),
+                    "coverage": [prophet_coverage_by_cp[round(model.changepoint_prior_scale, 2)]],
+                }
+            ),
+        )
+
+    current_cp = {"value": 0.03}
+
+    def fake_fit_and_forecast_with_cp(
+        df_prepared, forecast_periods, changepoint_prior_scale, interval_width
+    ):
+        current_cp["value"] = round(changepoint_prior_scale, 2)
+        return DummySeries(), DummyForecast(), DummyModel(changepoint_prior_scale, interval_width)
+
+    def fake_backtest_with_method(model, series, forecast_horizon, start, stride):
+        if round(model.interval_width, 2) == 0.85:
+            return {
+                "MAPE": 10.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 9.5,
+                "MAE": 4.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 3.5,
+                "RMSE": 5.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 4.6,
+            }
+        return {
+            "MAPE": 9.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 8.8,
+            "MAE": 3.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 2.8,
+            "RMSE": 4.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 3.8,
+        }
+
+    monkeypatch.setattr("visit_forecast.tuning.fit_and_forecast", fake_fit_and_forecast_with_cp)
+    monkeypatch.setattr("visit_forecast.tuning.backtest", fake_backtest_with_method)
+    monkeypatch.setattr(
+        "visit_forecast.tuning.prophet_cross_validation_metrics",
+        fake_prophet_cv_metrics,
+    )
+    monkeypatch.setattr(
+        "visit_forecast.tuning.collect_conformal_residuals",
+        lambda **kwargs: pd.DataFrame({"residual": [1.0]}),
+    )
+    monkeypatch.setattr(
+        "visit_forecast.tuning.build_conformal_intervals",
+        lambda future_df, residuals_df, target_coverage: (
+            future_df,
+            pd.DataFrame(),
+            conformal_summary_by_cp[current_cp["value"]],
+        ),
+    )
+
+    result = select_joint_forecast_configuration(
+        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        forecast_periods=1,
+        target_coverage=0.90,
+        changepoint_candidates=[0.03, 0.05],
+        interval_width_candidates=[0.85],
+    )
+
+    assert result.uncertainty_method == "conformal"
+    assert result.changepoint_prior_scale == 0.05
+    assert result.interval_width == 0.90
+    assert result.primary_metric == "Joint model score"
+    assert result.primary_score is not None
+    assert result.diagnostics_df["selected"].sum() == 1
 
 
 def test_forecast_visits_manual_preserves_selected_values(monkeypatch):
@@ -290,3 +435,521 @@ def test_forecast_visits_auto_uses_tuned_values(monkeypatch):
     assert result.tuning_primary_metric == "MAPE+RMSE"
     assert result.tuning_primary_score == 1.08
     assert result.tuning_diagnostics_df is not None
+
+
+def test_forecast_visits_conformal_scales_intervals_with_capacity_adjustments(monkeypatch):
+    monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        service,
+        "prepare_dataframe",
+        lambda **kwargs: (
+            pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+                    "y": [100.0, 120.0],
+                }
+            ),
+            "All",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "fit_and_forecast",
+        lambda **kwargs: ("series", "forecast", object()),
+    )
+    monkeypatch.setattr(
+        service,
+        "backtest",
+        lambda **kwargs: {"MAPE": 1.0, "MAE": 2.0, "RMSE": 3.0},
+    )
+    monkeypatch.setattr(
+        service,
+        "build_future_forecast_df",
+        lambda forecast, last_hist_date, capacity_phases: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "forecast_month": [1],
+                "yhat_original": [100.0],
+                "yhat_adjusted": [80.0],
+                "adj_applied_any": [True],
+                "adj_applied": [True],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "prophet_future_intervals",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "yhat_lower": [90.0],
+                "yhat_upper": [110.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "collect_conformal_residuals",
+        lambda **kwargs: pd.DataFrame({"residual": [1.0]}),
+    )
+    monkeypatch.setattr(
+        service,
+        "build_conformal_intervals",
+        lambda future_df, residuals_df, target_coverage: (
+            future_df.assign(
+                yhat_lower_conformal=[90.0],
+                yhat_upper_conformal=[110.0],
+            ),
+            pd.DataFrame(
+                {
+                    "horizon_step": [1],
+                    "empirical_coverage": [0.91],
+                    "target_coverage": [target_coverage],
+                    "n_calibration_forecasts": [12],
+                    "fallback_used": [False],
+                }
+            ),
+            {
+                "empirical_coverage_overall": 0.91,
+                "empirical_coverage_by_horizon": {1: 0.91},
+                "avg_interval_width": 20.0,
+                "median_interval_width": 20.0,
+                "interval_width_over_mean_actual": 0.2,
+                "n_calibration_forecasts": 12,
+                "fallback_used": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "prophet_cross_validation_metrics",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    result = service.forecast_visits(
+        use_synthetic=False,
+        df=pd.DataFrame(),
+        forecast_periods=1,
+        department="All",
+        target_coverage=0.90,
+        uncertainty_method="conformal",
+        tuning_mode="manual",
+    )
+
+    future_df = result.future_forecast_df
+    assert future_df.loc[0, "yhat_lower_conformal"] == 72.0
+    assert future_df.loc[0, "yhat_upper_conformal"] == 88.0
+    assert future_df.loc[0, "yhat_lower"] == 72.0
+    assert future_df.loc[0, "yhat_upper"] == 88.0
+    assert future_df.loc[0, "interval_source"] == "conformal"
+    assert result.interval_diagnostics_df is not None
+    assert result.interval_summary_metrics["empirical_coverage_overall"] == 0.91
+
+
+def test_forecast_visits_auto_skips_interval_width_tuning_in_conformal_mode(monkeypatch):
+    select_calls = []
+
+    monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        service,
+        "prepare_dataframe",
+        lambda **kwargs: (
+            pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+                    "y": [100.0, 120.0],
+                }
+            ),
+            "All",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "fit_and_forecast",
+        lambda **kwargs: ("series", "forecast", object()),
+    )
+    monkeypatch.setattr(
+        service,
+        "backtest",
+        lambda **kwargs: {"MAPE": 1.0, "MAE": 2.0, "RMSE": 3.0},
+    )
+    monkeypatch.setattr(
+        service,
+        "build_future_forecast_df",
+        lambda forecast, last_hist_date, capacity_phases: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "forecast_month": [1],
+                "yhat_original": [130.0],
+                "yhat_adjusted": [130.0],
+                "adj_applied_any": [False],
+                "adj_applied": [False],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service, "prophet_future_intervals", lambda *args, **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        service,
+        "collect_conformal_residuals",
+        lambda **kwargs: pd.DataFrame(
+            {
+                "cutoff": [pd.Timestamp("2024-01-01")],
+                "ds": [pd.Timestamp("2024-02-01")],
+                "horizon_step": [1],
+                "actual": [130.0],
+                "predicted": [128.0],
+                "residual": [2.0],
+                "abs_residual": [2.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "prophet_cross_validation_metrics",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    def fake_select_prophet_hyperparameters(**kwargs):
+        select_calls.append(kwargs)
+        return TuningSelection(
+            changepoint_prior_scale=0.03,
+            interval_width=0.92,
+            primary_metric="MAPE+RMSE",
+            primary_score=1.01,
+            note="Skipped interval width tuning for conformal mode.",
+            diagnostics_df=pd.DataFrame(),
+        )
+
+    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+
+    result = service.forecast_visits(
+        use_synthetic=False,
+        df=pd.DataFrame(),
+        forecast_periods=1,
+        department="All",
+        target_coverage=0.92,
+        uncertainty_method="conformal",
+        tuning_mode="auto",
+    )
+
+    assert select_calls
+    assert select_calls[0]["tune_interval_width"] is False
+    assert select_calls[0]["fixed_interval_width"] == 0.92
+    assert result.target_coverage == 0.92
+
+
+def test_forecast_visits_auto_tune_respects_manual_prophet_interval(monkeypatch):
+    select_calls = []
+    fit_calls = []
+
+    monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        service,
+        "prepare_dataframe",
+        lambda **kwargs: (
+            pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+                    "y": [100.0, 120.0],
+                }
+            ),
+            "All",
+        ),
+    )
+
+    def fake_fit_and_forecast(
+        df_prepared, forecast_periods, changepoint_prior_scale, interval_width
+    ):
+        fit_calls.append((changepoint_prior_scale, interval_width))
+        return "series", "forecast", object()
+
+    monkeypatch.setattr(service, "fit_and_forecast", fake_fit_and_forecast)
+    monkeypatch.setattr(
+        service,
+        "backtest",
+        lambda **kwargs: {"MAPE": 1.0, "MAE": 2.0, "RMSE": 3.0},
+    )
+    monkeypatch.setattr(
+        service,
+        "build_future_forecast_df",
+        lambda forecast, last_hist_date, capacity_phases: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "forecast_month": [1],
+                "yhat_original": [130.0],
+                "yhat_adjusted": [130.0],
+                "adj_applied_any": [False],
+                "adj_applied": [False],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "prophet_future_intervals",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "yhat_lower": [120.0],
+                "yhat_upper": [140.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "prophet_cross_validation_metrics",
+        lambda *args, **kwargs: (
+            pd.DataFrame(),
+            pd.DataFrame(
+                {
+                    "horizon": pd.to_timedelta(["30 days"]),
+                    "coverage": [0.88],
+                }
+            ),
+        ),
+    )
+
+    def fake_select_prophet_hyperparameters(**kwargs):
+        select_calls.append(kwargs)
+        return TuningSelection(
+            changepoint_prior_scale=0.03,
+            interval_width=0.92,
+            primary_metric="MAPE+RMSE",
+            primary_score=1.01,
+            note="Interval width tuning skipped; using fixed interval / target coverage 0.92 from the current uncertainty settings.",
+            diagnostics_df=pd.DataFrame(),
+        )
+
+    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+
+    result = service.forecast_visits(
+        use_synthetic=False,
+        df=pd.DataFrame(),
+        forecast_periods=1,
+        department="All",
+        target_coverage=0.92,
+        uncertainty_method="prophet",
+        tuning_mode="auto",
+    )
+
+    assert select_calls
+    assert select_calls[0]["tune_interval_width"] is False
+    assert select_calls[0]["fixed_interval_width"] == 0.92
+    assert fit_calls[-1] == (0.03, 0.92)
+    assert result.uncertainty_method == "prophet"
+    assert result.target_coverage == 0.92
+
+
+def test_forecast_visits_auto_selects_best_uncertainty_method(monkeypatch):
+    monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        service,
+        "prepare_dataframe",
+        lambda **kwargs: (
+            pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-01-01", "2024-02-01", "2024-03-01"]),
+                    "y": [100.0, 120.0, 130.0],
+                }
+            ),
+            "All",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "fit_and_forecast",
+        lambda **kwargs: ("series", "forecast", object()),
+    )
+    monkeypatch.setattr(
+        service,
+        "backtest",
+        lambda **kwargs: {"MAPE": 1.0, "MAE": 2.0, "RMSE": 3.0},
+    )
+    monkeypatch.setattr(
+        service,
+        "build_future_forecast_df",
+        lambda forecast, last_hist_date, capacity_phases: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-04-01"]),
+                "forecast_month": [1],
+                "yhat_original": [130.0],
+                "yhat_adjusted": [130.0],
+                "adj_applied_any": [False],
+                "adj_applied": [False],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "prophet_future_intervals",
+        lambda *args, **kwargs: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-04-01"]),
+                "yhat_lower": [120.0],
+                "yhat_upper": [140.0],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "collect_conformal_residuals",
+        lambda **kwargs: pd.DataFrame({"residual": [1.0]}),
+    )
+    monkeypatch.setattr(
+        service,
+        "build_conformal_intervals",
+        lambda future_df, residuals_df, target_coverage: (
+            future_df.assign(
+                yhat_lower_conformal=[125.0],
+                yhat_upper_conformal=[135.0],
+            ),
+            pd.DataFrame(
+                {
+                    "horizon_step": [1],
+                    "empirical_coverage": [0.89],
+                    "target_coverage": [target_coverage],
+                    "n_calibration_forecasts": [10],
+                    "fallback_used": [False],
+                }
+            ),
+            {
+                "empirical_coverage_overall": 0.89,
+                "empirical_coverage_by_horizon": {1: 0.89},
+                "avg_interval_width": 10.0,
+                "median_interval_width": 10.0,
+                "interval_width_over_mean_actual": 0.08,
+                "n_calibration_forecasts": 10,
+                "fallback_used": False,
+            },
+        ),
+    )
+    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "prophet_cross_validation_metrics",
+        lambda *args, **kwargs: (
+            pd.DataFrame(),
+            pd.DataFrame(
+                {
+                    "horizon": pd.to_timedelta(["30 days"]),
+                    "coverage": [0.75],
+                }
+            ),
+        ),
+    )
+
+    result = service.forecast_visits(
+        use_synthetic=False,
+        df=pd.DataFrame(),
+        forecast_periods=1,
+        department="All",
+        target_coverage=0.90,
+        uncertainty_method="auto",
+        tuning_mode="manual",
+    )
+
+    assert result.requested_uncertainty_method == "auto"
+    assert result.uncertainty_method == "conformal"
+    assert result.future_forecast_df.loc[0, "interval_source"] == "conformal"
+    assert result.future_forecast_df.loc[0, "yhat_lower"] == 125.0
+    assert result.tuning_note is not None
+    assert "auto-selected conformal" in result.tuning_note.lower()
+    assert result.tuning_diagnostics_df is not None
+    assert (
+        result.tuning_diagnostics_df["parameter_family"] == "uncertainty_method"
+    ).any()
+
+
+def test_forecast_visits_joint_auto_uses_joint_selector(monkeypatch):
+    select_calls = []
+
+    monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
+    monkeypatch.setattr(
+        service,
+        "prepare_dataframe",
+        lambda **kwargs: (
+            pd.DataFrame(
+                {
+                    "ds": pd.to_datetime(["2024-01-01", "2024-02-01"]),
+                    "y": [100.0, 120.0],
+                }
+            ),
+            "All",
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "fit_and_forecast",
+        lambda **kwargs: ("series", "forecast", object()),
+    )
+    monkeypatch.setattr(
+        service,
+        "backtest",
+        lambda **kwargs: {"MAPE": 1.0, "MAE": 2.0, "RMSE": 3.0},
+    )
+    monkeypatch.setattr(
+        service,
+        "build_future_forecast_df",
+        lambda forecast, last_hist_date, capacity_phases: pd.DataFrame(
+            {
+                "ds": pd.to_datetime(["2024-03-01"]),
+                "forecast_month": [1],
+                "yhat_original": [130.0],
+                "yhat_adjusted": [130.0],
+                "adj_applied_any": [False],
+                "adj_applied": [False],
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        service, "prophet_future_intervals", lambda *args, **kwargs: pd.DataFrame()
+    )
+    monkeypatch.setattr(
+        service,
+        "collect_conformal_residuals",
+        lambda **kwargs: pd.DataFrame({"residual": [2.0]}),
+    )
+    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "prophet_cross_validation_metrics",
+        lambda *args, **kwargs: (None, None),
+    )
+
+    def fake_select_joint_forecast_configuration(**kwargs):
+        select_calls.append(kwargs)
+        return TuningSelection(
+            changepoint_prior_scale=0.03,
+            interval_width=0.90,
+            primary_metric="Joint model score",
+            primary_score=1.01,
+            note="Joint auto-tune selected conformal.",
+            diagnostics_df=pd.DataFrame(),
+            uncertainty_method="conformal",
+        )
+
+    monkeypatch.setattr(
+        service,
+        "select_joint_forecast_configuration",
+        fake_select_joint_forecast_configuration,
+    )
+
+    result = service.forecast_visits(
+        use_synthetic=False,
+        df=pd.DataFrame(),
+        forecast_periods=1,
+        department="All",
+        target_coverage=0.92,
+        uncertainty_method="auto",
+        tuning_mode="auto",
+    )
+
+    assert select_calls
+    assert select_calls[0]["target_coverage"] == 0.92
+    assert result.uncertainty_method == "conformal"
+    assert result.selected_interval_width == 0.90
+    assert result.target_coverage == 0.92

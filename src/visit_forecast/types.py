@@ -23,6 +23,11 @@ class ForecastResult:
     tuning_mode: str = "manual"
     selected_changepoint_prior_scale: Optional[float] = None
     selected_interval_width: Optional[float] = None
+    requested_uncertainty_method: str = "prophet"
+    uncertainty_method: str = "prophet"
+    target_coverage: float = 0.90
+    interval_diagnostics_df: Optional[pd.DataFrame] = None
+    interval_summary_metrics: Optional[Dict[str, object]] = None
     tuning_primary_metric: Optional[str] = None
     tuning_primary_score: Optional[float] = None
     tuning_note: Optional[str] = None
