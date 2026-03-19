@@ -17,7 +17,11 @@ from .model_prophet import (
     prophet_full_forecast_df,
     prophet_cross_validation_metrics,
 )
-from .tuning import select_joint_forecast_configuration, select_prophet_hyperparameters
+from .tuning import (
+    select_joint_forecast_configuration,
+    select_prophet_hyperparameters,
+    select_uncertainty_configuration,
+)
 from .types import ForecastResult
 
 
@@ -489,6 +493,7 @@ def forecast_visits(
     target_coverage: Optional[float] = None,
     uncertainty_method: Literal["prophet", "conformal", "auto"] = "prophet",
     tuning_mode: str = "manual",
+    joint_auto_tuning_enabled: bool = True,
 ) -> ForecastResult:
     if forecast_periods <= 0:
         raise ValueError("forecast_periods must be > 0")
@@ -535,17 +540,79 @@ def forecast_visits(
 
     selected_changepoint_prior_scale = float(changepoint_prior_scale)
     selected_interval_width = float(requested_target_coverage)
+    effective_target_coverage = float(requested_target_coverage)
     tuning_primary_metric = None
     tuning_primary_score = None
     tuning_note = None
     tuning_diagnostics_df = None
+    selected_uncertainty_method_from_tuning = None
+    used_joint_auto_tuning = bool(
+        tuning_mode == "auto"
+        and uncertainty_method == "auto"
+        and joint_auto_tuning_enabled
+    )
+    used_separate_auto_passes = bool(
+        tuning_mode == "auto"
+        and uncertainty_method == "auto"
+        and not joint_auto_tuning_enabled
+    )
 
     if tuning_mode == "auto":
-        if uncertainty_method == "auto":
+        if used_joint_auto_tuning:
             tuning_selection = select_joint_forecast_configuration(
                 df_prepared=df_prepared,
                 forecast_periods=forecast_periods,
                 target_coverage=requested_target_coverage,
+            )
+            selected_changepoint_prior_scale = (
+                tuning_selection.changepoint_prior_scale
+            )
+            selected_interval_width = tuning_selection.interval_width
+            tuning_primary_metric = tuning_selection.primary_metric
+            tuning_primary_score = tuning_selection.primary_score
+            tuning_note = tuning_selection.note
+            tuning_diagnostics_df = tuning_selection.diagnostics_df
+            selected_uncertainty_method_from_tuning = tuning_selection.uncertainty_method
+        elif used_separate_auto_passes:
+            changepoint_tuning_selection = select_prophet_hyperparameters(
+                df_prepared=df_prepared,
+                forecast_periods=forecast_periods,
+                tune_interval_width=False,
+                fixed_interval_width=requested_target_coverage,
+            )
+            selected_changepoint_prior_scale = (
+                changepoint_tuning_selection.changepoint_prior_scale
+            )
+            uncertainty_tuning_selection = select_uncertainty_configuration(
+                df_prepared=df_prepared,
+                forecast_periods=forecast_periods,
+                changepoint_prior_scale=selected_changepoint_prior_scale,
+            )
+            selected_interval_width = uncertainty_tuning_selection.interval_width
+            effective_target_coverage = uncertainty_tuning_selection.interval_width
+            selected_uncertainty_method_from_tuning = (
+                uncertainty_tuning_selection.uncertainty_method
+            )
+            tuning_primary_metric = uncertainty_tuning_selection.primary_metric
+            tuning_primary_score = uncertainty_tuning_selection.primary_score
+            tuning_note = " ".join(
+                note
+                for note in [
+                    changepoint_tuning_selection.note,
+                    uncertainty_tuning_selection.note,
+                    (
+                        "Joint auto tuning evaluation was off, so changepoint tuning "
+                        "and uncertainty tuning were evaluated in separate passes."
+                    ),
+                ]
+                if note
+            )
+            tuning_diagnostics_df = pd.concat(
+                [
+                    changepoint_tuning_selection.diagnostics_df,
+                    uncertainty_tuning_selection.diagnostics_df,
+                ],
+                ignore_index=True,
             )
         else:
             tuning_selection = select_prophet_hyperparameters(
@@ -554,14 +621,14 @@ def forecast_visits(
                 tune_interval_width=False,
                 fixed_interval_width=requested_target_coverage,
             )
-        selected_changepoint_prior_scale = (
-            tuning_selection.changepoint_prior_scale
-        )
-        selected_interval_width = tuning_selection.interval_width
-        tuning_primary_metric = tuning_selection.primary_metric
-        tuning_primary_score = tuning_selection.primary_score
-        tuning_note = tuning_selection.note
-        tuning_diagnostics_df = tuning_selection.diagnostics_df
+            selected_changepoint_prior_scale = (
+                tuning_selection.changepoint_prior_scale
+            )
+            selected_interval_width = tuning_selection.interval_width
+            tuning_primary_metric = tuning_selection.primary_metric
+            tuning_primary_score = tuning_selection.primary_score
+            tuning_note = tuning_selection.note
+            tuning_diagnostics_df = tuning_selection.diagnostics_df
     elif tuning_mode != "manual":
         raise ValueError("tuning_mode must be either 'manual' or 'auto'")
 
@@ -636,7 +703,7 @@ def forecast_visits(
                 build_conformal_intervals(
                     future_df=future_df,
                     residuals_df=conformal_residuals_df,
-                    target_coverage=requested_target_coverage,
+                    target_coverage=effective_target_coverage,
                 )
             )
             conformal_interval_diagnostics_df = interval_diagnostics_df
@@ -682,22 +749,26 @@ def forecast_visits(
         prophet_interval_summary_metrics,
     ) = _build_prophet_interval_validation(
         cv_metrics_df=cv_metrics,
-        target_coverage=requested_target_coverage,
+        target_coverage=effective_target_coverage,
     )
 
     selected_uncertainty_method = uncertainty_method
     uncertainty_method_note = None
     uncertainty_method_diagnostics_df = None
 
-    if uncertainty_method == "auto" and tuning_mode == "auto" and tuning_selection.uncertainty_method:
-        selected_uncertainty_method = tuning_selection.uncertainty_method
+    if (
+        uncertainty_method == "auto"
+        and tuning_mode == "auto"
+        and selected_uncertainty_method_from_tuning
+    ):
+        selected_uncertainty_method = selected_uncertainty_method_from_tuning
     elif uncertainty_method == "auto":
         (
             selected_uncertainty_method,
             uncertainty_method_diagnostics_df,
             uncertainty_method_note,
         ) = _build_uncertainty_method_selection(
-            target_coverage=requested_target_coverage,
+            target_coverage=effective_target_coverage,
             prophet_summary=prophet_interval_summary_metrics,
             conformal_summary=conformal_interval_summary_metrics,
         )
@@ -747,7 +818,7 @@ def forecast_visits(
         **interval_summary_metrics,
         "interval_source_used": interval_source_used,
         "requested_uncertainty_method": uncertainty_method,
-        "target_coverage": float(requested_target_coverage),
+        "target_coverage": float(effective_target_coverage),
         "uncertainty_method": selected_uncertainty_method,
     }
 
@@ -767,7 +838,8 @@ def forecast_visits(
         selected_interval_width=selected_interval_width,
         requested_uncertainty_method=uncertainty_method,
         uncertainty_method=selected_uncertainty_method,
-        target_coverage=float(requested_target_coverage),
+        joint_auto_tuning_enabled=used_joint_auto_tuning,
+        target_coverage=float(effective_target_coverage),
         interval_diagnostics_df=interval_diagnostics_df,
         interval_summary_metrics=interval_summary_metrics,
         tuning_primary_metric=tuning_primary_metric,

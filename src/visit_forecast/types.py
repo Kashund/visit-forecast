@@ -25,6 +25,7 @@ class ForecastResult:
     selected_interval_width: Optional[float] = None
     requested_uncertainty_method: str = "prophet"
     uncertainty_method: str = "prophet"
+    joint_auto_tuning_enabled: bool = False
     target_coverage: float = 0.90
     interval_diagnostics_df: Optional[pd.DataFrame] = None
     interval_summary_metrics: Optional[Dict[str, object]] = None

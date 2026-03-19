@@ -22,6 +22,7 @@ assert sidebar_module_spec is not None and sidebar_module_spec.loader is not Non
 sidebar_module_spec.loader.exec_module(sidebar_module)
 
 _infer_timeframe_bounds = sidebar_module._infer_timeframe_bounds
+_resolve_joint_auto_tuning_state = sidebar_module._resolve_joint_auto_tuning_state
 _sync_timeframe_defaults = sidebar_module._sync_timeframe_defaults
 
 
@@ -129,3 +130,31 @@ def test_sync_timeframe_defaults_updates_when_pasted_dataset_changes():
 
     assert session_state["start"] == "2025-02-01"
     assert session_state["end"] == "2025-05-01"
+
+
+def test_resolve_joint_auto_tuning_state_defaults_off_when_both_controls_are_auto():
+    session_state: dict[str, object] = {}
+
+    visible, enabled = _resolve_joint_auto_tuning_state(
+        session_state,
+        tuning_mode="auto",
+        uncertainty_method="auto",
+    )
+
+    assert visible is True
+    assert enabled is False
+    assert session_state["joint_auto_tuning_enabled"] is False
+
+
+def test_resolve_joint_auto_tuning_state_hides_and_deactivates_when_any_control_is_manual():
+    session_state: dict[str, object] = {"joint_auto_tuning_enabled": True}
+
+    visible, enabled = _resolve_joint_auto_tuning_state(
+        session_state,
+        tuning_mode="manual",
+        uncertainty_method="auto",
+    )
+
+    assert visible is False
+    assert enabled is False
+    assert session_state["joint_auto_tuning_enabled"] is False

@@ -553,3 +553,151 @@ def select_joint_forecast_configuration(
         diagnostics_df=diagnostics_df,
         uncertainty_method=str(selected_row["uncertainty_method"]),
     )
+
+
+def select_uncertainty_configuration(
+    df_prepared: pd.DataFrame,
+    forecast_periods: int,
+    changepoint_prior_scale: float,
+    target_coverage_candidates: Iterable[float] = DEFAULT_INTERVAL_WIDTH_CANDIDATES,
+) -> TuningSelection:
+    rows: list[dict[str, object]] = []
+    candidate_order = {"prophet": 0, "conformal": 1}
+
+    for candidate_target_coverage in target_coverage_candidates:
+        candidate_target_coverage = float(candidate_target_coverage)
+        for method_name in ["prophet", "conformal"]:
+            row = {
+                "parameter_family": "uncertainty_configuration",
+                "candidate_value": (
+                    f"{method_name}|coverage={candidate_target_coverage:.2f}"
+                ),
+                "uncertainty_method": method_name,
+                "changepoint_prior_scale": float(changepoint_prior_scale),
+                "interval_width": candidate_target_coverage,
+                "target_coverage": candidate_target_coverage,
+                "primary_score_name": "coverage_gap",
+                "primary_score_value": float("nan"),
+                "tie_breaker_name": "interval_width_over_mean_actual",
+                "tie_breaker_value": float("nan"),
+                "empirical_coverage": float("nan"),
+                "coverage_gap": float("nan"),
+                "interval_width_over_mean_actual": float("nan"),
+                "avg_interval_width": float("nan"),
+                "fallback_used": False,
+                "selected": False,
+                "note": "",
+                "candidate_order": candidate_order[method_name],
+            }
+            try:
+                series, forecast, model = fit_and_forecast(
+                    df_prepared=df_prepared,
+                    forecast_periods=forecast_periods,
+                    changepoint_prior_scale=float(changepoint_prior_scale),
+                    interval_width=candidate_target_coverage,
+                )
+                if method_name == "prophet":
+                    _, cv_metrics = prophet_cross_validation_metrics(
+                        model,
+                        initial="730 days",
+                        period="180 days",
+                        horizon="365 days",
+                    )
+                    interval_summary = _summarize_prophet_interval_validation(
+                        cv_metrics_df=cv_metrics,
+                        target_coverage=candidate_target_coverage,
+                    )
+                else:
+                    interval_summary = _summarize_conformal_interval_validation(
+                        model=model,
+                        series=series,
+                        forecast=forecast,
+                        forecast_periods=forecast_periods,
+                        target_coverage=candidate_target_coverage,
+                    )
+
+                row["empirical_coverage"] = float(
+                    interval_summary.get("empirical_coverage_overall", float("nan"))
+                )
+                row["coverage_gap"] = float(
+                    interval_summary.get("coverage_gap", float("nan"))
+                )
+                row["interval_width_over_mean_actual"] = float(
+                    interval_summary.get("interval_width_over_mean_actual", float("nan"))
+                )
+                row["avg_interval_width"] = float(
+                    interval_summary.get("avg_interval_width", float("nan"))
+                )
+                row["fallback_used"] = bool(
+                    interval_summary.get("fallback_used", False)
+                )
+                row["primary_score_value"] = row["coverage_gap"]
+                row["tie_breaker_value"] = row["interval_width_over_mean_actual"]
+                if pd.isna(row["tie_breaker_value"]):
+                    row["tie_breaker_value"] = row["avg_interval_width"]
+
+                if pd.isna(row["empirical_coverage"]):
+                    row["note"] = "Coverage unavailable"
+                elif bool(row["fallback_used"]):
+                    row["note"] = "Fallback interval calibration used"
+            except Exception as exc:
+                row["note"] = type(exc).__name__
+
+            rows.append(row)
+
+    diagnostics_df = pd.DataFrame(rows)
+    valid_rows = diagnostics_df.dropna(subset=["primary_score_value"]).copy()
+    if valid_rows.empty:
+        diagnostics_df.loc[
+            diagnostics_df["candidate_value"].eq(
+                f"prophet|coverage={DEFAULT_INTERVAL_WIDTH_FALLBACK:.2f}"
+            ),
+            "selected",
+        ] = True
+        note = (
+            "Separate uncertainty tuning could not score uncertainty configurations; "
+            f"used fallback uncertainty_method=prophet and target coverage={DEFAULT_INTERVAL_WIDTH_FALLBACK:.2f}."
+        )
+        return TuningSelection(
+            changepoint_prior_scale=float(changepoint_prior_scale),
+            interval_width=DEFAULT_INTERVAL_WIDTH_FALLBACK,
+            primary_metric="coverage_gap",
+            primary_score=None,
+            note=note,
+            diagnostics_df=diagnostics_df.drop(columns=["candidate_order"]),
+            uncertainty_method="prophet",
+        )
+
+    valid_rows["fallback_penalty"] = valid_rows["fallback_used"].astype(int)
+    valid_rows["tie_breaker_rank"] = pd.to_numeric(
+        valid_rows["tie_breaker_value"], errors="coerce"
+    ).fillna(float("inf"))
+    selected_row = valid_rows.sort_values(
+        [
+            "primary_score_value",
+            "fallback_penalty",
+            "tie_breaker_rank",
+            "candidate_order",
+            "interval_width",
+        ]
+    ).iloc[0]
+
+    selected_candidate = str(selected_row["candidate_value"])
+    diagnostics_df.loc[
+        diagnostics_df["candidate_value"] == selected_candidate,
+        "selected",
+    ] = True
+    note = (
+        f"Separate uncertainty tuning selected {selected_row['uncertainty_method']} "
+        f"with target coverage={float(selected_row['interval_width']):.2f} using "
+        "coverage gap and interval width."
+    )
+    return TuningSelection(
+        changepoint_prior_scale=float(changepoint_prior_scale),
+        interval_width=float(selected_row["interval_width"]),
+        primary_metric="coverage_gap",
+        primary_score=float(selected_row["primary_score_value"]),
+        note=note,
+        diagnostics_df=diagnostics_df.drop(columns=["candidate_order"]),
+        uncertainty_method=str(selected_row["uncertainty_method"]),
+    )

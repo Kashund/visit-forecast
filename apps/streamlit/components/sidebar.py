@@ -73,6 +73,23 @@ def _sync_timeframe_defaults(
     session_state["_timeframe_source_signature"] = signature
 
 
+def _resolve_joint_auto_tuning_state(
+    session_state,
+    *,
+    tuning_mode: str,
+    uncertainty_method: str,
+) -> tuple[bool, bool]:
+    should_show = tuning_mode == "auto" and uncertainty_method == "auto"
+    if not should_show:
+        session_state["joint_auto_tuning_enabled"] = False
+        return False, False
+
+    if "joint_auto_tuning_enabled" not in session_state:
+        session_state["joint_auto_tuning_enabled"] = False
+
+    return True, bool(session_state["joint_auto_tuning_enabled"])
+
+
 def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     st.sidebar.header("Inputs")
 
@@ -256,6 +273,14 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             "If Uncertainty method is set manually, the current interval / target coverage input is preserved for the run."
         )
 
+    show_joint_auto_tuning_toggle, joint_auto_tuning_enabled = (
+        _resolve_joint_auto_tuning_state(
+            st.session_state,
+            tuning_mode=tuning_mode,
+            uncertainty_method=uncertainty_method,
+        )
+    )
+
     changepoint_prior_scale = float(
         st.sidebar.slider(
             "Changepoint prior scale",
@@ -267,6 +292,23 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             disabled=tuning_mode == "auto",
         )
     )
+
+    if show_joint_auto_tuning_toggle:
+        toggle_fn = getattr(st.sidebar, "toggle", st.sidebar.checkbox)
+        joint_auto_tuning_enabled = bool(
+            toggle_fn(
+                "Joint Auto Tuning Evaluation",
+                key="joint_auto_tuning_enabled",
+                help=(
+                    "On evaluates changepoint prior scale and uncertainty method together "
+                    "in one joint search. Off auto-tunes changepoint first, then "
+                    "auto-selects the uncertainty method in a separate pass."
+                ),
+            )
+        )
+        st.sidebar.caption(
+            "Displayed only when both Model tuning and Uncertainty method are set to auto."
+        )
 
     st.sidebar.divider()
     st.sidebar.markdown("**Filtering**")
@@ -314,6 +356,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "interval_width": target_coverage,
         "uncertainty_method": uncertainty_method,
         "tuning_mode": tuning_mode,
+        "joint_auto_tuning_enabled": joint_auto_tuning_enabled,
         "run": run,
     }
 

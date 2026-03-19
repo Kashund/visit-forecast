@@ -270,6 +270,7 @@ common = dict(
     target_coverage=float(controls["target_coverage"]),
     uncertainty_method=str(controls["uncertainty_method"]),
     tuning_mode=str(controls["tuning_mode"]),
+    joint_auto_tuning_enabled=bool(controls["joint_auto_tuning_enabled"]),
 )
 
 # --- Compute only when Run clicked ---
@@ -349,6 +350,10 @@ if baseline and baseline > 0:
         f"MAE/mean={mae_v/baseline:.2%}  •  RMSE/mean={rmse_v/baseline:.2%}"
     )
 
+st.caption(
+    "MAPE, MAE, and RMSE score the point forecast. Changing uncertainty method or target coverage usually changes the interval bands and interval validation, not these point-error metrics, unless the selected changepoint setting also changes."
+)
+
 st.caption(f"Departments included: {result.department_info}")
 
 if result.tuning_mode == "auto":
@@ -378,6 +383,12 @@ if result.tuning_mode == "auto":
             else "n/a"
         ),
     )
+    if getattr(result, "requested_uncertainty_method", "") == "auto":
+        st.caption(
+            "Auto evaluation mode: joint search"
+            if getattr(result, "joint_auto_tuning_enabled", False)
+            else "Auto evaluation mode: separate passes for changepoint tuning and uncertainty selection"
+        )
 
 if result.tuning_note:
     st.caption(result.tuning_note)
