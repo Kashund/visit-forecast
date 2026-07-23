@@ -33,7 +33,11 @@ def forecast_line_chart(
     lower_col = None
     upper_col = None
     for lc, uc in [("yhat_lower_95", "yhat_upper_95"), ("yhat_lower", "yhat_upper")]:
-        if lc in df.columns and uc in df.columns:
+        if (
+            lc in df.columns
+            and uc in df.columns
+            and df[[lc, uc]].notna().any().any()
+        ):
             lower_col, upper_col = lc, uc
             break
 
@@ -163,6 +167,8 @@ def forecast_line_chart(
             for phase_number, phase in enumerate(phase_metadata, start=1):
                 if not phase.get("enabled", False):
                     continue
+                if float(phase.get("percent", 0.0)) == 0.0:
+                    continue
 
                 month_start = int(phase.get("start_month", 1))
                 month_end = int(phase.get("end_month", month_start))
@@ -179,9 +185,16 @@ def forecast_line_chart(
                 annotation_text = (
                     f"Phase {phase_number}: {phase_mode} {phase_percent:.1f}%"
                 )
+                shade_start = phase_rows["ds"].min()
+                shade_end = phase_rows["ds"].max()
+                if shade_start == shade_end:
+                    # Zero-width rectangles are invisible; pad a single-month
+                    # phase so the shading can be seen.
+                    shade_start = shade_start - pd.Timedelta(days=12)
+                    shade_end = shade_end + pd.Timedelta(days=12)
                 fig.add_vrect(
-                    x0=phase_rows["ds"].min(),
-                    x1=phase_rows["ds"].max(),
+                    x0=shade_start,
+                    x1=shade_end,
                     opacity=0.12,
                     line_width=0,
                     annotation_text=annotation_text,

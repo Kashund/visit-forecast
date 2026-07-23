@@ -27,6 +27,7 @@ def prophet_future_intervals(
     last_hist_date: pd.Timestamp,
     forecast_periods: int,
     freq: str = "MS",
+    covariates_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Compute Prophet uncertainty intervals for future horizon.
 
@@ -36,6 +37,33 @@ def prophet_future_intervals(
     start = (pd.to_datetime(last_hist_date) + pd.offsets.MonthBegin(1)).normalize()
     future_dates = pd.date_range(start=start, periods=int(forecast_periods), freq=freq)
     future = pd.DataFrame({"ds": future_dates})
+    if covariates_df is not None:
+        merge_df = covariates_df.copy()
+        merge_df["ds"] = pd.to_datetime(merge_df["ds"])
+        future = future.merge(merge_df, on="ds", how="left")
+
+    required_regressors = list(
+        getattr(model.model, "extra_regressors", {}).keys()
+    )
+    missing_regressors = [
+        regressor for regressor in required_regressors if regressor not in future.columns
+    ]
+    if missing_regressors:
+        raise ValueError(
+            "Prophet interval generation is missing required future covariates: "
+            + ", ".join(missing_regressors)
+        )
+    null_regressors = [
+        regressor
+        for regressor in required_regressors
+        if future[regressor].isna().any()
+    ]
+    if null_regressors:
+        raise ValueError(
+            "Prophet interval generation has missing values for future covariates: "
+            + ", ".join(null_regressors)
+        )
+
     pred = model.model.predict(future)
     out = pred[["ds", "yhat_lower", "yhat_upper"]].copy()
     out["ds"] = pd.to_datetime(out["ds"])
@@ -97,6 +125,7 @@ def _generate_historical_forecasts(
     start: Union[float, pd.Timestamp] = 0.7,
     stride: Optional[int] = None,
     last_points_only: bool = True,
+    future_covariates: Optional[TimeSeries] = None,
 ):
     stride = stride or forecast_horizon
 
@@ -114,6 +143,10 @@ def _generate_historical_forecasts(
         "verbose": False,
         "last_points_only": last_points_only,
     }
+    if future_covariates is not None and getattr(
+        model, "supports_future_covariates", False
+    ):
+        base_kwargs["future_covariates"] = future_covariates
 
     try:
         return model.historical_forecasts(series, **base_kwargs)
@@ -196,6 +229,7 @@ def collect_conformal_residuals(
     forecast_horizon: int,
     start: Union[float, pd.Timestamp] = 0.7,
     stride: int = 1,
+    future_covariates: Optional[TimeSeries] = None,
 ) -> pd.DataFrame:
     forecasts = _generate_historical_forecasts(
         model=model,
@@ -204,6 +238,7 @@ def collect_conformal_residuals(
         start=start,
         stride=stride,
         last_points_only=False,
+        future_covariates=future_covariates,
     )
     residuals_df = _collect_forecast_alignment_rows(series, forecasts)
     if residuals_df.empty:
@@ -216,11 +251,56 @@ def collect_conformal_residuals(
                 "predicted",
                 "residual",
                 "abs_residual",
+                "conformal_partition",
             ]
         )
-    return residuals_df.sort_values(["cutoff", "horizon_step", "ds"]).reset_index(
-        drop=True
+    residuals_df = residuals_df.sort_values(
+        ["cutoff", "horizon_step", "ds"]
+    ).reset_index(drop=True)
+    return _partition_conformal_residuals(residuals_df)
+
+
+def _partition_conformal_residuals(
+    residuals_df: pd.DataFrame,
+    *,
+    evaluation_fraction: float = 0.25,
+    min_calibration_cutoffs: int = 3,
+) -> pd.DataFrame:
+    """Reserve the newest rolling cutoffs for independent coverage evaluation.
+
+    Partitioning by cutoff keeps every horizon from the same forecast origin in
+    the same set. Histories with too few cutoffs remain calibration-only; their
+    interval coverage is reported as unavailable rather than being measured on
+    the residuals used to construct the interval.
+    """
+    partitioned = residuals_df.copy()
+    partitioned["conformal_partition"] = "calibration"
+    if partitioned.empty or "cutoff" not in partitioned.columns:
+        return partitioned
+
+    cutoff_values = (
+        pd.to_datetime(partitioned["cutoff"], errors="coerce")
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
     )
+    if len(cutoff_values) <= int(min_calibration_cutoffs):
+        return partitioned
+
+    requested_evaluation_cutoffs = max(
+        1, int(np.ceil(len(cutoff_values) * float(evaluation_fraction)))
+    )
+    evaluation_count = min(
+        requested_evaluation_cutoffs,
+        len(cutoff_values) - int(min_calibration_cutoffs),
+    )
+    evaluation_cutoffs = set(cutoff_values[-evaluation_count:])
+    cutoff_series = pd.to_datetime(partitioned["cutoff"], errors="coerce")
+    partitioned.loc[
+        cutoff_series.isin(evaluation_cutoffs), "conformal_partition"
+    ] = "evaluation"
+    return partitioned
 
 
 def build_conformal_intervals(
@@ -232,6 +312,26 @@ def build_conformal_intervals(
     output_df = future_df.copy()
     output_df["yhat_lower_conformal"] = np.nan
     output_df["yhat_upper_conformal"] = np.nan
+
+    has_explicit_partition = "conformal_partition" in residuals_df.columns
+    if has_explicit_partition:
+        calibration_residuals_df = residuals_df[
+            residuals_df["conformal_partition"].eq("calibration")
+        ].copy()
+        evaluation_residuals_df = residuals_df[
+            residuals_df["conformal_partition"].eq("evaluation")
+        ].copy()
+        validation_mode = (
+            "held_out_cutoffs"
+            if not evaluation_residuals_df.empty
+            else "unavailable"
+        )
+    else:
+        # Backward-compatible low-level behavior for callers that provide their
+        # own residual frame. Production residual collection always partitions.
+        calibration_residuals_df = residuals_df.copy()
+        evaluation_residuals_df = residuals_df.copy()
+        validation_mode = "calibration_resubstitution"
 
     if output_df.empty:
         diagnostics_df = pd.DataFrame(
@@ -253,8 +353,10 @@ def build_conformal_intervals(
             "avg_interval_width": float("nan"),
             "median_interval_width": float("nan"),
             "interval_width_over_mean_actual": float("nan"),
-            "n_calibration_forecasts": 0,
+            "n_calibration_forecasts": int(calibration_residuals_df.shape[0]),
+            "n_evaluation_forecasts": int(evaluation_residuals_df.shape[0]),
             "fallback_used": True,
+            "validation_mode": validation_mode,
         }
         return output_df, diagnostics_df, summary
 
@@ -263,7 +365,9 @@ def build_conformal_intervals(
     upper_quantile = min(1.0, 1.0 - (alpha / 2.0))
 
     abs_residuals = (
-        pd.to_numeric(residuals_df.get("abs_residual"), errors="coerce")
+        pd.to_numeric(
+            calibration_residuals_df.get("abs_residual"), errors="coerce"
+        )
         .dropna()
         .to_numpy(dtype=float)
     )
@@ -278,11 +382,20 @@ def build_conformal_intervals(
 
     max_horizon = int(output_df["forecast_month"].max())
     for horizon_step in range(1, max_horizon + 1):
-        horizon_rows = residuals_df[
-            pd.to_numeric(residuals_df["horizon_step"], errors="coerce").eq(horizon_step)
+        calibration_horizon_rows = calibration_residuals_df[
+            pd.to_numeric(
+                calibration_residuals_df["horizon_step"], errors="coerce"
+            ).eq(horizon_step)
+        ].copy()
+        evaluation_horizon_rows = evaluation_residuals_df[
+            pd.to_numeric(
+                evaluation_residuals_df["horizon_step"], errors="coerce"
+            ).eq(horizon_step)
         ].copy()
         horizon_residuals = (
-            pd.to_numeric(horizon_rows.get("residual"), errors="coerce")
+            pd.to_numeric(
+                calibration_horizon_rows.get("residual"), errors="coerce"
+            )
             .dropna()
             .to_numpy(dtype=float)
         )
@@ -302,18 +415,26 @@ def build_conformal_intervals(
 
         horizon_offsets[horizon_step] = (lower_offset, upper_offset, fallback_used)
 
-        if horizon_rows.empty or not np.isfinite(lower_offset) or not np.isfinite(upper_offset):
+        if (
+            evaluation_horizon_rows.empty
+            or not np.isfinite(lower_offset)
+            or not np.isfinite(upper_offset)
+        ):
             empirical_coverage = float("nan")
             avg_interval_width = float("nan")
             median_interval_width = float("nan")
         else:
             lower_bound = np.clip(
-                horizon_rows["predicted"].to_numpy(dtype=float) + lower_offset,
+                evaluation_horizon_rows["predicted"].to_numpy(dtype=float)
+                + lower_offset,
                 a_min=0.0,
                 a_max=None,
             )
-            upper_bound = horizon_rows["predicted"].to_numpy(dtype=float) + upper_offset
-            actual_values = horizon_rows["actual"].to_numpy(dtype=float)
+            upper_bound = (
+                evaluation_horizon_rows["predicted"].to_numpy(dtype=float)
+                + upper_offset
+            )
+            actual_values = evaluation_horizon_rows["actual"].to_numpy(dtype=float)
             empirical_coverage = float(
                 np.mean((actual_values >= lower_bound) & (actual_values <= upper_bound))
             )
@@ -324,7 +445,10 @@ def build_conformal_intervals(
         diagnostics_rows.append(
             {
                 "horizon_step": horizon_step,
-                "n_calibration_forecasts": int(horizon_rows.shape[0]),
+                "n_calibration_forecasts": int(
+                    calibration_horizon_rows.shape[0]
+                ),
+                "n_evaluation_forecasts": int(evaluation_horizon_rows.shape[0]),
                 "target_coverage": float(target_coverage),
                 "empirical_coverage": empirical_coverage,
                 "avg_interval_width": avg_interval_width,
@@ -350,20 +474,22 @@ def build_conformal_intervals(
 
     diagnostics_df = pd.DataFrame(diagnostics_rows)
 
-    if residuals_df.empty or diagnostics_df.empty:
+    if calibration_residuals_df.empty or diagnostics_df.empty:
         summary = {
             "empirical_coverage_overall": float("nan"),
             "empirical_coverage_by_horizon": {},
             "avg_interval_width": float("nan"),
             "median_interval_width": float("nan"),
             "interval_width_over_mean_actual": float("nan"),
-            "n_calibration_forecasts": int(residuals_df.shape[0]),
+            "n_calibration_forecasts": int(calibration_residuals_df.shape[0]),
+            "n_evaluation_forecasts": int(evaluation_residuals_df.shape[0]),
             "fallback_used": True,
+            "validation_mode": validation_mode,
         }
         return output_df, diagnostics_df, summary
 
     summary_rows: list[dict[str, float]] = []
-    for row in residuals_df.itertuples(index=False):
+    for row in evaluation_residuals_df.itertuples(index=False):
         lower_offset, upper_offset, _ = horizon_offsets.get(
             int(row.horizon_step), (float("nan"), float("nan"), True)
         )
@@ -411,8 +537,10 @@ def build_conformal_intervals(
         "avg_interval_width": avg_interval_width,
         "median_interval_width": median_interval_width,
         "interval_width_over_mean_actual": interval_width_over_mean_actual,
-        "n_calibration_forecasts": int(residuals_df.shape[0]),
+        "n_calibration_forecasts": int(calibration_residuals_df.shape[0]),
+        "n_evaluation_forecasts": int(evaluation_residuals_df.shape[0]),
         "fallback_used": bool(diagnostics_df["fallback_used"].any()),
+        "validation_mode": validation_mode,
     }
     return output_df, diagnostics_df, summary
 
@@ -423,6 +551,7 @@ def backtest(
     forecast_horizon: int,
     start: Union[float, pd.Timestamp] = 0.7,
     stride: Optional[int] = None,
+    future_covariates: Optional[TimeSeries] = None,
 ) -> Dict[str, float]:
     """Run historical forecasts and compute MAPE/MAE/RMSE.
 
@@ -434,7 +563,12 @@ def backtest(
         forecast_horizon=forecast_horizon,
         start=start,
         stride=stride,
-        last_points_only=True,
+        # Evaluate every month of each backtest fold. With True, only the
+        # final month of each fold is scored, which both wastes information
+        # and contradicts the UI description of these metrics as the average
+        # error per forecasted month.
+        last_points_only=False,
+        future_covariates=future_covariates,
     )
 
     aligned_rows = _collect_forecast_alignment_rows(series, bt)
@@ -457,13 +591,21 @@ def prophet_full_forecast_df(
     model: Prophet,
     forecast_periods: int,
     freq: str = "MS",
+    covariates_df: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """Return Prophet-native forecast dataframe for history + future.
 
     This is used for Prophet plots (plot_plotly / plot_components).
+    When the model was fit with extra regressors, pass covariates_df
+    (a dataframe with a ds column plus the regressor columns) so
+    Prophet's predict call has the values it needs.
     """
     # Prophet's make_future_dataframe includes history by default
     future = model.model.make_future_dataframe(periods=int(forecast_periods), freq=freq, include_history=True)
+    if covariates_df is not None:
+        merge_df = covariates_df.copy()
+        merge_df["ds"] = pd.to_datetime(merge_df["ds"])
+        future = future.merge(merge_df, on="ds", how="left")
     forecast_df = model.model.predict(future)
     # Ensure datetime
     forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])

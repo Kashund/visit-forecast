@@ -33,3 +33,6 @@ class ForecastResult:
     tuning_primary_score: Optional[float] = None
     tuning_note: Optional[str] = None
     tuning_diagnostics_df: Optional[pd.DataFrame] = None
+    requested_model: str = "prophet"
+    selected_model: str = "prophet"
+    used_calendar_covariates: bool = False

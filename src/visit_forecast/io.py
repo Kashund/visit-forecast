@@ -70,29 +70,67 @@ def prepare_dataframe(
     df = df_raw.copy()
     df["Date"] = to_month_start(df["Date"])
     df["Visits"] = pd.to_numeric(df["Visits"], errors="coerce")
+    df["Department"] = df["Department"].astype("string").str.strip()
     df = df.dropna(subset=["Date", "Visits", "Department"])
+    df = df[df["Department"].ne("")]
+    df = df[np.isfinite(df["Visits"])]
+    negative_visit_count = int(df["Visits"].lt(0).sum())
+    if negative_visit_count:
+        raise ValueError(
+            "Visits must be non-negative; "
+            f"found {negative_visit_count} negative value(s)."
+        )
 
-    start_dt = pd.to_datetime(timeframe_start)
-    end_dt = pd.to_datetime(timeframe_end)
+    start_dt = pd.to_datetime(timeframe_start).to_period("M").to_timestamp()
+    end_dt = pd.to_datetime(timeframe_end).to_period("M").to_timestamp()
+    if start_dt > end_dt:
+        raise ValueError("timeframe_start must be on or before timeframe_end.")
     df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
 
     if exclude_departments:
-        df = df[~df["Department"].isin(exclude_departments)]
+        normalized_exclusions = {
+            str(department_name).strip()
+            for department_name in exclude_departments
+        }
+        df = df[~df["Department"].isin(normalized_exclusions)]
 
     if df.empty:
         raise ValueError("No data remains after timeframe/exclusion filtering.")
 
-    if department != "All":
-        df_f = df[df["Department"] == department].copy()
+    normalized_department = str(department).strip()
+    if normalized_department != "All":
+        df_f = df[df["Department"] == normalized_department].copy()
         if df_f.empty:
-            raise ValueError(f"No data found for department='{department}' after filtering.")
-        dept_info = department
+            raise ValueError(
+                f"No data found for department='{normalized_department}' after filtering."
+            )
+        # Multiple source rows can normalize to the same month. Aggregate them
+        # before constructing a Darts series so each month has one observation.
+        df_f = df_f.groupby("Date", as_index=False)["Visits"].sum()
+        df_f["Department"] = normalized_department
+        dept_info = normalized_department
     else:
-        included = sorted(df["Department"].unique())
+        included = sorted(df["Department"].astype(str).unique())
         dept_info = ", ".join(included)
         df_f = df.groupby("Date", as_index=False)["Visits"].sum()
         df_f["Department"] = "All"
 
     df_f = df_f.rename(columns={"Date": "ds", "Visits": "y"})
     df_f = df_f.sort_values("ds").reset_index(drop=True)
+
+    expected_months = pd.date_range(
+        df_f["ds"].min(), df_f["ds"].max(), freq="MS"
+    )
+    missing_months = expected_months.difference(pd.DatetimeIndex(df_f["ds"]))
+    if not missing_months.empty:
+        missing_preview = ", ".join(
+            timestamp.strftime("%Y-%m")
+            for timestamp in missing_months[:6]
+        )
+        suffix = "…" if len(missing_months) > 6 else ""
+        raise ValueError(
+            "Monthly history contains missing observations: "
+            f"{missing_preview}{suffix}. Fill or remove the gap before forecasting."
+        )
+
     return df_f, dept_info

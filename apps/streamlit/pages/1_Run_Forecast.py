@@ -15,7 +15,12 @@ from visit_forecast.fiscal import (
 )
 from components.sidebar import sidebar_controls
 from components.charts import forecast_line_chart, fiscal_bar_chart
-from state import apply_forecast_run_to_session
+from state import (
+    apply_forecast_run_to_session,
+    clear_persisted_history,
+    ensure_history_loaded,
+    history_persistence_enabled,
+)
 
 # Optional Prophet diagnostics helpers
 try:
@@ -42,7 +47,9 @@ def _timeseries_to_pd(ts) -> pd.DataFrame:
 
 def _score_label(metric_name: str, value: float, baseline: float | None = None):
     if metric_name.upper() == "MAPE":
-        v = value * 100.0 if value <= 1.0 else value
+        # Backtest MAPE is already expressed in percent. A value like 0.8
+        # means 0.8% error (excellent) and must not be rescaled to 80%.
+        v = value
         if v < 10:
             return ("Optimal", "🟢")
         if v < 20:
@@ -183,10 +190,12 @@ def _style_tuning_diagnostics_table(tuning_df: pd.DataFrame):
         "primary_score_value": "{:.4f}",
         "tie_breaker_value": "{:.4f}",
     }
-    if "candidate_value" in display_df.columns and pd.api.types.is_numeric_dtype(
-        display_df["candidate_value"]
-    ):
-        formatters["candidate_value"] = "{:.2f}"
+    if "candidate_value" in display_df.columns:
+        if pd.api.types.is_numeric_dtype(display_df["candidate_value"]):
+            formatters["candidate_value"] = "{:.2f}"
+        else:
+            # Mixed float/str values break Arrow serialization in st.dataframe.
+            display_df["candidate_value"] = display_df["candidate_value"].astype(str)
 
     styler = display_df.style.format(formatters, na_rep="n/a")
 
@@ -231,9 +240,8 @@ def _style_interval_validation_table(interval_df: pd.DataFrame):
     return styler
 
 
-# Initialize history store
-if "forecast_history" not in st.session_state:
-    st.session_state["forecast_history"] = []  # list[dict]
+# Initialize history store (hydrates persisted runs from disk on first load)
+ensure_history_loaded(st.session_state)
 
 
 # --- Sidebar ---
@@ -245,9 +253,18 @@ except Exception as e:
 
 # Sidebar: clear history control
 with st.sidebar.expander("Forecast run history", expanded=False):
-    st.caption("Stores the last 20 runs (this browser session).")
+    if history_persistence_enabled():
+        st.caption(
+            "Stores the last 20 runs. Disk persistence is enabled for local mode."
+        )
+    else:
+        st.caption(
+            "Stores the last 20 runs in this browser session. "
+            "Disk persistence is disabled."
+        )
     if st.button("Clear forecast history", key="clear_history"):
         st.session_state["forecast_history"] = []
+        clear_persisted_history()
         # also clear current result
         if "forecast_result" in st.session_state:
             del st.session_state["forecast_result"]
@@ -257,7 +274,7 @@ with st.sidebar.expander("Forecast run history", expanded=False):
 # Preview
 if df_preview is not None:
     st.caption("Preview (first 50 rows)")
-    st.dataframe(df_preview.head(50), use_container_width=True)
+    st.dataframe(df_preview.head(50), width="stretch")
 
 common = dict(
     timeframe_start=controls["timeframe_start"],
@@ -266,6 +283,8 @@ common = dict(
     department=controls["department"],
     exclude_departments=controls["exclude_departments"] or None,
     capacity_phases=controls["capacity_phases"],
+    model_choice=str(controls.get("model_choice", "prophet")),
+    use_calendar_covariates=bool(controls.get("use_calendar_covariates", False)),
     changepoint_prior_scale=float(controls["changepoint_prior_scale"]),
     target_coverage=float(controls["target_coverage"]),
     uncertainty_method=str(controls["uncertainty_method"]),
@@ -301,7 +320,7 @@ if "forecast_result" not in st.session_state:
     if st.session_state["forecast_history"]:
         st.subheader("Forecast run history (last 20)")
         st.dataframe(
-            pd.DataFrame(st.session_state["forecast_history"]), use_container_width=True
+            pd.DataFrame(st.session_state["forecast_history"]), width="stretch"
         )
     st.stop()
 
@@ -354,7 +373,19 @@ st.caption(
     "MAPE, MAE, and RMSE score the point forecast. Changing uncertainty method or target coverage usually changes the interval bands and interval validation, not these point-error metrics, unless the selected changepoint setting also changes."
 )
 
-st.caption(f"Departments included: {result.department_info}")
+model_display_names = {
+    "prophet": "Prophet",
+    "ets": "Holt-Winters (ETS)",
+    "theta": "Theta",
+    "arima": "SARIMA",
+    "seasonal_naive": "Seasonal naive",
+}
+selected_model_name = getattr(result, "selected_model", "prophet")
+requested_model_name = getattr(result, "requested_model", selected_model_name)
+model_caption = f"Model: {model_display_names.get(selected_model_name, selected_model_name)}"
+if requested_model_name == "auto":
+    model_caption += " (auto-selected)"
+st.caption(f"{model_caption}  •  Departments included: {result.department_info}")
 
 if result.tuning_mode == "auto":
     t1, t2, t3 = st.columns(3)
@@ -396,7 +427,7 @@ if result.tuning_diagnostics_df is not None and not result.tuning_diagnostics_df
     with st.expander("Auto-tune diagnostics", expanded=False):
         st.dataframe(
             _style_tuning_diagnostics_table(result.tuning_diagnostics_df),
-            use_container_width=True,
+            width="stretch",
         )
 
 st.markdown("---")
@@ -493,7 +524,7 @@ if interval_diagnostics_df is not None and not interval_diagnostics_df.empty:
         _style_interval_validation_table(
             display_interval_df[ordered_interval_columns]
         ),
-        use_container_width=True,
+        width="stretch",
     )
 else:
     st.info("Interval validation details are not available for this run.")
@@ -616,7 +647,7 @@ if selected_results_section == "📉 Forecast":
     if fig is None:
         st.warning("No future dates found beyond the last historical date.")
     else:
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 elif selected_results_section == "📅 Future Table":
     scenario_summary = st.session_state.get(
@@ -627,7 +658,7 @@ elif selected_results_section == "📅 Future Table":
     )
     future_table_df = result.future_forecast_df.copy()
     future_table_df["scenario_summary"] = scenario_summary
-    st.dataframe(future_table_df, use_container_width=True)
+    st.dataframe(future_table_df, width="stretch")
     st.download_button(
         "Download future forecast CSV",
         data=future_table_df.to_csv(index=False).encode("utf-8"),
@@ -686,13 +717,13 @@ elif selected_results_section == "🏛️ Fiscal Summary":
 
     st.dataframe(
         _style_fiscal_summary_table(selected_fiscal_summary),
-        use_container_width=True,
+        width="stretch",
     )
     fig2 = fiscal_bar_chart(
         chart_fiscal_summary, period_column=selected_period_column
     )
     if fig2 is not None:
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     st.download_button(
         "Download fiscal summary CSV",
@@ -707,7 +738,7 @@ elif selected_results_section == "🧾 Run History":
         st.info("No runs yet.")
     else:
         hist_df = pd.DataFrame(st.session_state["forecast_history"])
-        st.dataframe(hist_df, use_container_width=True)
+        st.dataframe(hist_df, width="stretch")
         st.download_button(
             "Download run history CSV",
             data=hist_df.to_csv(index=False).encode("utf-8"),
@@ -746,7 +777,7 @@ elif selected_results_section == "📊 Prophet CV":
                 "target_coverage"
             ),
         )
-        st.dataframe(_style_prophet_cv_table(cv_display_df), use_container_width=True)
+        st.dataframe(_style_prophet_cv_table(cv_display_df), width="stretch")
         st.caption(
             "Indicators: coverage within +/-0.03 of target coverage = On target, "
             "+/-0.08 = Watch; RMSE/MAE <= 1.15 = Uniform, <= 1.40 = Some spikes, "
@@ -776,7 +807,7 @@ elif selected_results_section == "📊 Prophet CV":
                 figm = px.line(
                     dfp, x=xcol, y=c, markers=True, title=f"{c.upper()} vs {xlabel}"
                 )
-                st.plotly_chart(figm, use_container_width=True)
+                st.plotly_chart(figm, width="stretch")
 
         st.download_button(
             "Download CV metrics CSV",
@@ -787,7 +818,7 @@ elif selected_results_section == "📊 Prophet CV":
 
     if cv_raw is not None and not getattr(cv_raw, "empty", True):
         with st.expander("Raw CV rows (df_cv)"):
-            st.dataframe(cv_raw.head(200), use_container_width=True)
+            st.dataframe(cv_raw.head(200), width="stretch")
             st.download_button(
                 "Download CV raw CSV",
                 data=cv_raw.to_csv(index=False).encode("utf-8"),
@@ -839,8 +870,74 @@ elif selected_results_section == "🧩 Prophet Plots":
             xaxis_title="Date",
             yaxis_title="Visits",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
-        st.caption(
-            "Components (trend/seasonality) require the fitted Prophet model object to render exactly like Prophet. If you'd like, we can persist the fitted model in session_state to render full component plots."
-        )
+        # Component plots rendered from Prophet's native predict output.
+        component_columns = [
+            column
+            for column in ["trend", "yearly", "business_days"]
+            if column in dfp.columns
+        ]
+        if component_columns:
+            st.markdown("**Components**")
+        for component_name in component_columns:
+            component_fig = go.Figure()
+            if component_name == "yearly":
+                # One seasonal cycle, labeled by month, is easier to read
+                # than the repeating multi-year waveform.
+                yearly_df = dfp[["ds", "yearly"]].copy()
+                yearly_df["month"] = yearly_df["ds"].dt.month
+                monthly_effect = (
+                    yearly_df.groupby("month")["yearly"].mean().reindex(range(1, 13))
+                )
+                month_labels = [
+                    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                ]
+                component_fig.add_trace(
+                    go.Scatter(
+                        x=month_labels,
+                        y=monthly_effect.values,
+                        mode="lines+markers",
+                        name="yearly",
+                    )
+                )
+                component_fig.update_layout(
+                    title="Yearly seasonality (average effect by month)",
+                    xaxis_title="Month",
+                    yaxis_title="Effect on visits",
+                )
+            else:
+                lower_column = f"{component_name}_lower"
+                upper_column = f"{component_name}_upper"
+                if lower_column in dfp.columns and upper_column in dfp.columns:
+                    component_fig.add_trace(
+                        go.Scatter(
+                            x=dfp["ds"], y=dfp[upper_column], mode="lines",
+                            line=dict(dash="dot"), name=upper_column,
+                        )
+                    )
+                    component_fig.add_trace(
+                        go.Scatter(
+                            x=dfp["ds"], y=dfp[lower_column], mode="lines",
+                            line=dict(dash="dot"), name=lower_column,
+                            fill="tonexty", fillcolor="rgba(0,0,0,0.08)",
+                        )
+                    )
+                component_fig.add_trace(
+                    go.Scatter(
+                        x=dfp["ds"], y=dfp[component_name], mode="lines",
+                        name=component_name,
+                    )
+                )
+                titles = {
+                    "trend": "Trend",
+                    "business_days": "Calendar covariate effect (business days)",
+                }
+                component_fig.update_layout(
+                    title=titles.get(component_name, component_name),
+                    hovermode="x unified",
+                    xaxis_title="Date",
+                    yaxis_title="Effect on visits",
+                )
+            st.plotly_chart(component_fig, width="stretch")

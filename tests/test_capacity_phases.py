@@ -75,6 +75,42 @@ def test_normalize_capacity_phases_rejects_invalid_months_and_percent() -> None:
             forecast_periods=12,
         )
 
+    with pytest.raises(ValueError, match="loss percent must be <= 100"):
+        _normalize_capacity_phases(
+            [
+                CapacityPhase(
+                    enabled=True,
+                    mode="loss",
+                    percent=101,
+                    start_month=1,
+                    end_month=2,
+                )
+            ],
+            forecast_periods=12,
+        )
+
+
+def test_forecast_visits_rejects_invalid_legacy_capacity_loss() -> None:
+    with pytest.raises(ValueError, match="loss percent must be <= 100"):
+        forecast_visits(
+            use_synthetic=True,
+            timeframe_start="2020-04-01",
+            timeframe_end="2021-03-01",
+            forecast_periods=3,
+            adjustment_mode="loss",
+            adjustment_percent=150,
+        )
+
+    with pytest.raises(ValueError, match="percent must be >= 0"):
+        forecast_visits(
+            use_synthetic=True,
+            timeframe_start="2020-04-01",
+            timeframe_end="2021-03-01",
+            forecast_periods=3,
+            adjustment_mode="add",
+            adjustment_percent=-1,
+        )
+
 
 def test_forecast_visits_accepts_capacity_phases() -> None:
     result = forecast_visits(

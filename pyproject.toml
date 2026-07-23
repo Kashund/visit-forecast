@@ -1,16 +1,25 @@
 [project]
 name = "visit-forecast"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.10"
 dependencies = [
-  "pandas",
-  "numpy",
-  "matplotlib",
-  "plotly",
-  "openpyxl",
-  "darts",
-  "prophet",
-  "streamlit",
+  "pandas>=2.1,<3",
+  "numpy>=1.26,<3",
+  "matplotlib>=3.8,<4",
+  "plotly>=5.18,<7",
+  "openpyxl>=3.1,<4",
+  # Darts 0.41 retired the legacy u8darts package name. The core package
+  # still provides all models used here without requiring PyTorch extras.
+  "darts>=0.41,<0.47",
+  "prophet>=1.1.5,<2",
+  # width="stretch" (replacement for the removed use_container_width)
+  # requires Streamlit 1.49+.
+  "streamlit>=1.49,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
 ]
 
 [build-system]

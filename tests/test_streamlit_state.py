@@ -173,3 +173,62 @@ def test_apply_forecast_run_to_session_keeps_manual_uncertainty_inputs_during_au
     assert session_state["forecast_inputs"]["requested_uncertainty_method"] == "prophet"
     assert session_state["forecast_inputs"]["target_coverage"] == 0.95
     assert session_state["forecast_inputs"]["interval_width"] == 0.95
+
+
+def test_default_history_is_isolated_between_sessions_and_ignores_stale_disk(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("VISIT_FORECAST_HISTORY_DIR", str(tmp_path))
+    monkeypatch.delenv("VISIT_FORECAST_PERSIST_HISTORY", raising=False)
+    stale_path = state_module.history_file_path()
+    stale_path.write_text(
+        '[{"run_time": "private persisted run"}]',
+        encoding="utf-8",
+    )
+
+    session_a: dict[str, object] = {}
+    session_b: dict[str, object] = {}
+    state_module.ensure_history_loaded(session_a)
+    state_module.ensure_history_loaded(session_b)
+
+    assert session_a["forecast_history"] == []
+    assert session_b["forecast_history"] == []
+
+    common = {
+        "timeframe_start": "2020-04-01",
+        "timeframe_end": "2025-03-01",
+        "forecast_periods": 12,
+        "department": "All",
+        "exclude_departments": None,
+        "capacity_phases": [],
+        "changepoint_prior_scale": 0.05,
+        "target_coverage": 0.90,
+        "uncertainty_method": "conformal",
+        "tuning_mode": "manual",
+    }
+    apply_forecast_run_to_session(
+        session_a,
+        common=common,
+        result=_make_result(
+            requested_uncertainty_method="conformal",
+            selected_uncertainty_method="conformal",
+            target_coverage=0.90,
+            changepoint_prior_scale=0.05,
+            interval_width=0.90,
+            tuning_mode="manual",
+        ),
+        source_mode="Use synthetic sample",
+        scenario_summary="No phases configured",
+        run_time="2026-07-23 10:00:00",
+    )
+
+    assert len(session_a["forecast_history"]) == 1
+    assert session_b["forecast_history"] == []
+    assert stale_path.read_text(encoding="utf-8") == (
+        '[{"run_time": "private persisted run"}]'
+    )
+
+    new_session: dict[str, object] = {}
+    state_module.ensure_history_loaded(new_session)
+    assert new_session["forecast_history"] == []

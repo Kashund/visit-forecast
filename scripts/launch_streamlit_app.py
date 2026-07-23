@@ -92,6 +92,10 @@ def main() -> int:
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     launch_environment["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+    # This launcher binds only to localhost, so cross-session history is safe
+    # and convenient. Hosted deployments remain session-only unless their
+    # operator deliberately enables persistence.
+    launch_environment.setdefault("VISIT_FORECAST_PERSIST_HISTORY", "1")
 
     streamlit_process = subprocess.Popen(
         launch_command,
