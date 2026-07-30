@@ -22,10 +22,14 @@ jobs:
       - name: Verify lockfile
         run: uv lock --check
       - name: Install locked environment
-        run: uv sync --locked --extra dev
+        run: uv sync --locked --extra dev --no-editable
+      - name: Verify installed package and CLI
+        run: |
+          uv run --no-editable python -c "import visit_forecast; print(visit_forecast.__file__)"
+          uv run --no-editable python scripts/run_forecast_cli.py --help
       - name: Test
-        run: uv run python -m pytest -q
+        run: uv run --no-editable python -m pytest -q
       - name: Compile
-        run: uv run python -m compileall -q src apps scripts
+        run: uv run --no-editable python -m compileall -q src apps scripts
       - name: Build wheel
         run: uv build --wheel
