@@ -109,8 +109,8 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
 
     if source_mode == "Upload file":
         uploaded = st.sidebar.file_uploader(
-            "Upload Excel or CSV",
-            type=["xlsx", "xls", "csv"],
+            "Upload Excel (.xlsx) or CSV",
+            type=["xlsx", "csv"],
             key="uploader",
             help="File must include columns: Date, Visits, Department.",
         )
@@ -176,6 +176,30 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     default_end = min(12, forecast_periods)
     default_month_range = (1, default_end)
 
+    # If the forecast horizon shrank after phase windows were set, Streamlit
+    # would otherwise silently reset out-of-range sliders to their defaults,
+    # quietly moving an enabled adjustment onto the wrong months. Clamp the
+    # stored values to the new horizon instead and tell the user.
+    clamped_phase_numbers: list[int] = []
+    for phase_number in range(1, 5):
+        range_key = f"phase_{phase_number}_between"
+        stored_range = st.session_state.get(range_key)
+        if stored_range is None:
+            continue
+        stored_start, stored_end = int(stored_range[0]), int(stored_range[1])
+        clamped_start = max(1, min(stored_start, forecast_periods))
+        clamped_end = max(clamped_start, min(stored_end, forecast_periods))
+        if (clamped_start, clamped_end) != (stored_start, stored_end):
+            st.session_state[range_key] = (clamped_start, clamped_end)
+            if bool(st.session_state.get(f"phase_{phase_number}_enabled", False)):
+                clamped_phase_numbers.append(phase_number)
+    if clamped_phase_numbers:
+        clamped_list = ", ".join(str(n) for n in clamped_phase_numbers)
+        st.sidebar.warning(
+            f"Phase month range(s) for phase(s) {clamped_list} were clamped to "
+            f"the new {forecast_periods}-month horizon. Review them before running."
+        )
+
     for phase_number in range(1, 5):
         with st.sidebar.expander(f"Phase {phase_number}", expanded=False):
             phase_enabled = st.checkbox(
@@ -223,6 +247,48 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
                     "end_month": int(phase_month_range[1]),
                 }
             )
+
+    st.sidebar.divider()
+    st.sidebar.markdown("**Forecast model**")
+
+    model_label_map = {
+        "Auto (compare models)": "auto",
+        "Prophet": "prophet",
+        "Holt-Winters (ETS)": "ets",
+        "Theta": "theta",
+        "SARIMA": "arima",
+        "Seasonal naive (baseline)": "seasonal_naive",
+    }
+    model_choice_label = st.sidebar.selectbox(
+        "Model",
+        list(model_label_map.keys()),
+        index=0,
+        key="model_choice",
+        help=(
+            "Auto backtests every model (including a seasonal naive baseline) "
+            "and picks the best balanced MAPE and RMSE. Prophet keeps the "
+            "original behavior. ETS, Theta, and SARIMA are strong classical "
+            "models for monthly seasonal data and run much faster than Prophet."
+        ),
+    )
+    model_choice = model_label_map[model_choice_label]
+    if model_choice not in {"auto", "prophet"}:
+        st.sidebar.caption(
+            "Non-Prophet models use conformal calibrated intervals. "
+            "Prophet-only sections (Prophet CV, Prophet plots) will be empty."
+        )
+
+    use_calendar_covariates = st.sidebar.checkbox(
+        "Calendar covariates (business days per month)",
+        value=False,
+        key="use_calendar_covariates",
+        help=(
+            "Adds business days per month as a regressor. Months with more "
+            "clinic days generate more visits, so this can explain "
+            "month-to-month variation that pure seasonality misses. Applies "
+            "to Prophet and SARIMA; ETS, Theta, and seasonal naive ignore it."
+        ),
+    )
 
     st.sidebar.divider()
     st.sidebar.markdown("**Uncertainty**")
@@ -288,8 +354,8 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.50,
             0.05,
             key="cp",
-            help="Higher values allow the trend to change more aggressively (more flexible, higher overfit risk).",
-            disabled=tuning_mode == "auto",
+            help="Higher values allow the trend to change more aggressively (more flexible, higher overfit risk). Applies to Prophet only.",
+            disabled=tuning_mode == "auto" or model_choice not in {"auto", "prophet"},
         )
     )
 
@@ -351,6 +417,8 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "department": department,
         "exclude_departments": exclude_departments,
         "capacity_phases": capacity_phases,
+        "model_choice": model_choice,
+        "use_calendar_covariates": use_calendar_covariates,
         "changepoint_prior_scale": changepoint_prior_scale,
         "target_coverage": target_coverage,
         "interval_width": target_coverage,

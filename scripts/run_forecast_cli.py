@@ -63,6 +63,12 @@ def main() -> None:
     )
     parser.add_argument("--changepoint", type=float, default=0.05)
     parser.add_argument("--interval_width", type=float, default=0.90)
+    parser.add_argument(
+        "--model",
+        choices=["auto", "prophet", "ets", "theta", "arima", "seasonal_naive"],
+        default="prophet",
+        help="Forecast model. 'auto' backtests all models and picks the best.",
+    )
 
     args = parser.parse_args()
     capacity_phases = _parse_capacity_phases(args)
@@ -81,8 +87,12 @@ def main() -> None:
         capacity_phases=capacity_phases,
         changepoint_prior_scale=args.changepoint,
         interval_width=args.interval_width,
+        model_choice=args.model,
     )
 
+    print("Model:", result.selected_model)
+    if result.tuning_note:
+        print("Note:", result.tuning_note)
     print("Departments:", result.department_info)
     print("Metrics:", result.performance_metrics)
     print(result.fiscal_summary)
