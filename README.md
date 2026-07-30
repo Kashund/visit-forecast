@@ -71,26 +71,30 @@ rows for the same department/month are summed, Visits must be finite and
 non-negative, and each forecasted series must contain every month between its
 first and last observation.
 
-## Install (editable)
+## Install
 From repo root:
 ```bash
-pip install -e .
+pip install .
 ```
 
 For a reproducible development or deployment environment:
 
 ```bash
-uv sync --locked --extra dev
+uv sync --locked --extra dev --no-editable
 ```
+
+The non-editable install is intentional for Python 3.13 compatibility and
+matches CI. It verifies the built package instead of relying on an
+editable-install `.pth` file.
 
 ## Run the Streamlit app
 ```bash
-streamlit run apps/streamlit/Home.py
+uv run --no-editable streamlit run apps/streamlit/Home.py
 ```
 
 ## Quick launch shortcut (start + open browser)
 ```bash
-python scripts/launch_streamlit_app.py
+uv run --no-editable python scripts/launch_streamlit_app.py
 ```
 
 This helper starts Streamlit and automatically opens `http://127.0.0.1:8501` in your default web browser.
@@ -99,8 +103,17 @@ persistence. Direct or hosted Streamlit launches remain session-only by default.
 
 If you see `No module named streamlit`, use the same Python environment where this project is installed:
 ```bash
-python -m pip install -e .
-python scripts/launch_streamlit_app.py
+uv sync --locked --no-editable
+uv run --no-editable python scripts/launch_streamlit_app.py
+```
+
+## Run from the CLI
+
+```bash
+uv run --no-editable python scripts/run_forecast_cli.py \
+  --use_synthetic \
+  --model seasonal_naive \
+  --months 3
 ```
 
 ## Use from Python / notebooks
@@ -242,15 +255,24 @@ opt-in as described above. You can clear history from the sidebar.
 
 Before a production deployment:
 
-1. Install uv 0.9.6 and run `uv sync --locked --extra dev`.
-2. Run `uv run python -m pytest -q`.
-3. Run `uv run python -m compileall -q src apps scripts`.
-4. Keep `VISIT_FORECAST_PERSIST_HISTORY` unset for multi-user hosting.
-5. Store secrets in the hosting platform, never in `.streamlit/secrets.toml`.
-6. Confirm the deployment starts `streamlit run apps/streamlit/Home.py`.
+1. Install uv 0.9.6 and run
+   `uv sync --locked --extra dev --no-editable`.
+2. Run
+   `uv run --no-editable python -c "import visit_forecast"`.
+3. Run `uv run --no-editable python -m pytest -q`.
+4. Run
+   `uv run --no-editable python -m compileall -q src apps scripts`.
+5. Run
+   `uv run --no-editable python scripts/run_forecast_cli.py --help`.
+6. Confirm the deployment starts
+   `uv run --no-editable streamlit run apps/streamlit/Home.py`.
+7. Keep `VISIT_FORECAST_PERSIST_HISTORY` unset for multi-user hosting.
+8. Store secrets in the hosting platform, never in
+   `.streamlit/secrets.toml`.
 
-GitHub Actions repeats installation, tests, compilation, and wheel construction
-for pushes to `main` and pull requests.
+GitHub Actions repeats the non-editable install, package import, CLI smoke,
+tests, compilation, and wheel construction for pushes to `main` and pull
+requests.
 
 
 ## Metrics & interpretation
