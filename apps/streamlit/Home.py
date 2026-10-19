@@ -11,3 +11,7 @@ st.write(
     "and review fiscal-year summaries (FY = Apr → Mar)."
 )
 st.markdown("Use the pages on the left to run forecasts and validate data.")
+
+from components.session import session_sidebar
+
+session_sidebar()

@@ -2,6 +2,14 @@
 
 Reviewed: 2026-10-19. Baseline: `main` at `d6afcf191f6208e40bad4580892362c16ac934aa`.
 
+## Follow-up — navigation persistence
+
+Added a session-private active dataset shared automatically across all four workflows, including data selected before a model runs. Uploaded frames are retained independently of uploader widgets. Page widget values are saved separately from Streamlit's navigation cleanup, restoring training/model settings, department output, result/fiscal views, and scenario assumptions. Scenario Comparison now uses the shared source selector and infers uploaded/pasted/shared training bounds.
+
+Every sidebar provides **Clear data** to remove raw source copies, upload/paste widgets, snapshots, and the input cache while retaining completed forecast outputs. Source selectors and uploader generations reset together to prevent cleared data returning after navigation. Each workflow replaces results on a successful run; failed replacement runs and history clearing retain completed outputs. Data Check defaults to the active source and keeps previous run snapshots separately accessible. Persistence covers the current browser session, not app restarts.
+
+Verification: **129 tests passed** with 13 existing statsmodels warnings. Navigation tests cover CSV/XLSX uploads, data selection before runs, dataset replacement, clearing without reappearance, saved department/fiscal views, scenario assumptions, failed and successful forecast replacement, and session isolation. Compilation, undefined-name/unused-import checks, diff hygiene, and application health checks passed. A separate navigation check confirmed obsolete department filters reset when the source changes.
+
 ## Follow-up — mirrored forecast pages and source previews
 
 Run Forecast and Department Forecasts now use one shared sidebar, workflow controller, and result renderer. Department forecasts forward capacity phases, target coverage, tuning mode, and joint tuning to the same forecasting engine. A department output selector updates every selected-result panel without fitting again; the combined overview remains available separately. Sidebar keys are scoped per page, preserving independent selections while exposing matching controls and defaults.

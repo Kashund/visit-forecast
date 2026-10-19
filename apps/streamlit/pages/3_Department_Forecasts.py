@@ -9,4 +9,7 @@ st.title("🏥 Department Forecasts")
 st.caption(
     "Fit each included department independently, then switch the department output to review the same results and diagnostics as Run Forecast."
 )
-render_forecast_page(department_mode=True)
+from components.session import persistent_page
+
+with persistent_page("dept_"):
+    render_forecast_page(department_mode=True)

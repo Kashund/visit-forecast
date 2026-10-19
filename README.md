@@ -54,9 +54,17 @@ On Department Forecasts, choose All in the sidebar to fit each included departme
 
 ## Data Check previews
 
-Data Check can inspect **Current forecast data**, a new CSV/XLSX upload, pasted CSV, generated synthetic data, or either bundled sample CSV. Current forecast data defaults to the last completed run and also offers current inputs or a specific workflow's last run. Run inputs are copied into browser-session snapshots, so changing controls does not relabel an older forecast as using new data.
+Data Check can inspect **Current forecast data**, a new CSV/XLSX upload, pasted CSV, generated synthetic data, or either bundled sample CSV. Current forecast data defaults to the active dataset when available and also offers the last completed run, current inputs, or a specific workflow's last run. Run inputs are copied into browser-session snapshots, so changing controls does not relabel an older forecast as using new data.
 
 The preview shows the first 50 rows, source name, and row counts, with CSV download of all preview rows. For a saved run, switch between **Rows selected for forecast** (training dates and department/exclusion filters) and **Raw input**. Validation still checks the complete source and reports invalid records and missing department-month observations. Failed inputs remain available for inspection as current inputs; the last successful run remains separate.
+
+## Persistent session data and forecasts
+
+Uploading or selecting data on Run Forecast, Department Forecasts, Scenario Comparison, or Data Check makes it the active dataset immediately, before running a model. Other pages automatically reuse it through **Use shared dataset**; Data Check offers it under **Current forecast data**. Navigating through Home or any other section keeps the saved data, source name, and each page's settings. Selecting a different dataset replaces the active source across the app. Completed forecast snapshots retain the data used for that run.
+
+Each workflow keeps its completed results, charts, tables, exports, and selected views while you navigate. Returning to Department Forecasts also restores the selected department; Scenario Comparison restores both phase configurations. Editing inputs marks old results as pending an update. Only a successful new run in that workflow replaces its results; failed runs leave the previous forecast available. The sidebar identifies the latest completed workflow throughout the app.
+
+**Clear data**, available in every sidebar, removes the active source, saved uploads and pasted text, raw preview/run snapshots, and input cache from this browser session. It resets source selectors so cleared data cannot reappear on another page. Completed forecast outputs remain available, including the historical series embedded in those outputs. **Clear forecast history** clears the history list without removing completed outputs. Data and forecast persistence is private to the current Streamlit browser session; it does not survive a new session or server restart. Optional disk history stores run metadata only.
 
 ## Scenario comparison (page 4)
 The Scenario Comparison page fits the forecast once, then applies two capacity phase configurations (Scenario A and Scenario B) to the same fitted baseline, so differences between scenarios are purely the phase assumptions rather than refit noise. Phase-only reruns reuse the fitted baseline; changing data or baseline settings invalidates that reuse. Both scenarios support four phases, 100% loss, and additions above 100%. It shows a three-line chart (baseline, A, B), a monthly detail table with A minus Baseline, B minus Baseline, and A minus B deltas, fiscal year totals, and Excel export with Monthly_Comparison, FY_Summary, and Scenario_Definitions sheets. Programmatic access: `apply_capacity_phases_to_future_df(future_df, phases)` recomputes adjustments from `yhat_original`, so it never compounds on prior adjustments.
@@ -163,7 +171,7 @@ from visit_forecast import (
 )
 ```
 
-All forecast pages accept CSV/XLSX, pasted CSV, or synthetic input. Department and Scenario pages can also reuse a dataset from another run or Data Check in the same browser session. A warning identifies controls changed since the displayed result. Results are updated only when the corresponding Run button is pressed.
+All forecast pages accept CSV/XLSX, pasted CSV, generated data, or bundled samples. Selecting data on any workflow or Data Check makes it available automatically throughout the same browser session. A warning identifies controls changed since the displayed result. Results are updated only after the corresponding Run button completes successfully.
 
 CLI workflows keep the original forecast command and add these options:
 

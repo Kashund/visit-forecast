@@ -34,18 +34,47 @@ class DataSource:
         return self.frame.copy() if self.frame is not None else None
 
 
-def select_data_source(prefix="", container=None, *, include_current=False):
+def select_data_source(
+    prefix="", container=None, *, include_current=False, default_mode=None
+):
     ui = container if container is not None else st.sidebar
     choices = (["Current forecast data"] if include_current else []) + SOURCE_MODES
+    active = st.session_state.get("active_dataset")
+    seen = dict(st.session_state.get("source_seen", {}))
+    active_id = active["fingerprint"] if active else None
+    mode_key = f"{prefix}source_mode"
+    # Another page may have selected a new dataset since this page was visited.
+    # Prefer it automatically over an old uploader or pasted text widget.
+    if active and seen.get(prefix) != active_id and not include_current:
+        st.session_state[mode_key] = "Use shared dataset"
+    elif active and seen.get(prefix) != active_id and include_current:
+        st.session_state[mode_key] = "Current forecast data"
+        st.session_state.pop(f"{prefix}snapshot", None)
+    elif mode_key not in st.session_state and default_mode:
+        st.session_state[mode_key] = (
+            "Upload file"
+            if st.session_state.get("data_generation", 0)
+            else default_mode
+        )
+    seen[prefix] = active_id
+    st.session_state["source_seen"] = seen
     mode = ui.radio("Choose how to provide data", choices, key=f"{prefix}source_mode")
     selection = DataSource(mode, mode)
     if mode == "Upload file":
         selection.uploaded = ui.file_uploader(
-            "Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"], key=f"{prefix}uploader"
+            "Upload Excel (.xlsx) or CSV",
+            type=["xlsx", "csv"],
+            key=f"{prefix}uploader_{st.session_state.get('data_generation', 0)}",
         )
         if selection.uploaded is not None:
             selection.label = selection.uploaded.name
             selection.frame = read_data_file(selection.uploaded)
+        elif active and active["source_mode"] == mode:
+            selection.label = active["label"]
+            selection.frame = active["frame"].copy(deep=True)
+            ui.caption(
+                f"Saved upload: {selection.label}. Upload another file to replace it."
+            )
     elif mode == "Paste values (CSV)":
         selection.pasted_text = ui.text_area(
             "CSV data",
@@ -65,10 +94,10 @@ def select_data_source(prefix="", container=None, *, include_current=False):
         selection.label = filename
         selection.frame = read_data_file(SAMPLE_DIR / filename)
     elif mode == "Use shared dataset":
-        frame = st.session_state.get("shared_dataset")
+        frame = active["frame"] if active else st.session_state.get("shared_dataset")
         if frame is not None:
             selection.frame = frame.copy()
-            selection.label = "Shared dataset"
+            selection.label = active["label"] if active else "Shared dataset"
         else:
             ui.info(
                 "No shared dataset yet. Upload or paste data, select a sample, or run a forecast first."
@@ -76,6 +105,12 @@ def select_data_source(prefix="", container=None, *, include_current=False):
     elif mode == "Current forecast data":
         snapshots = st.session_state.get("forecast_data_snapshots", {})
         available = {}
+        if active:
+            available["Active dataset"] = {
+                **active,
+                "settings": {},
+                "stage": "Active dataset",
+            }
         if "last_run_data" in st.session_state:
             available["Last run"] = st.session_state["last_run_data"]
         if "current_input_data" in st.session_state:
@@ -129,8 +164,22 @@ def remember_data(frame, source, settings, workflow, *, ran=False):
         stage="Last run" if ran else "Current inputs",
         fingerprint=configuration_fingerprint({}, frame),
     )
+    if source.mode != "Current forecast data":
+        active = st.session_state.get("active_dataset")
+        if active is None or active["fingerprint"] != snapshot["fingerprint"]:
+            st.session_state["active_dataset"] = dict(snapshot)
+        seen = dict(st.session_state.get("source_seen", {}))
+        prefixes = {
+            "Run Forecast": "",
+            "Department Forecasts": "dept_",
+            "Scenario Comparison": "cmp_",
+            "Data Check": "check_",
+        }
+        seen[prefixes[workflow]] = snapshot["fingerprint"]
+        st.session_state["source_seen"] = seen
     st.session_state["current_input_data"] = snapshot
-    st.session_state["shared_dataset"] = frame.copy(deep=True)
+    if source.mode != "Current forecast data":
+        st.session_state["shared_dataset"] = frame.copy(deep=True)
     if ran:
         st.session_state["last_run_data"] = snapshot
         snapshots = dict(st.session_state.get("forecast_data_snapshots", {}))

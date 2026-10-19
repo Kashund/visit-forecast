@@ -40,7 +40,7 @@ def forecast_settings(controls):
     return {name: controls[name] for name in names}
 
 
-def history_sidebar(prefix, result_key):
+def history_sidebar(prefix):
     with st.sidebar.expander("Forecast run history", expanded=False):
         st.caption(
             "Stores the last 20 runs in this browser session. "
@@ -53,10 +53,10 @@ def history_sidebar(prefix, result_key):
         if st.button("Clear forecast history", key=f"{prefix}clear_history"):
             st.session_state["forecast_history"] = []
             st.session_state.pop("forecast_cache", None)
-            st.session_state.pop(result_key, None)
             clear_persisted_history()
-            st.success("Cleared.")
-            st.stop()
+            st.success(
+                "Forecast history cleared. Completed forecasts remain available."
+            )
 
 
 def render_department_overview(bundle, manifest):
@@ -136,25 +136,17 @@ def render_forecast_page(*, department_mode=False):
     except Exception as exc:
         st.error(f"Input configuration error: {exc}")
         st.stop()
-    history_sidebar(prefix, result_key)
+    history_sidebar(prefix)
     common = forecast_settings(controls)
     if raw is not None:
         remember_data(raw, controls["source"], common, workflow)
         preview_data(raw, controls["source"].label)
-    signature = configuration_fingerprint(
-        {
-            **common,
-            "source_mode": controls["source_mode"],
-            "source_label": controls["source"].label,
-        },
-        raw,
-    )
-    if controls["run"]:
-        if raw is None:
-            st.error(
-                "No data provided. Upload a file, paste CSV values, or choose a sample first."
-            )
-            st.stop()
+    signature = configuration_fingerprint(common, raw)
+    if controls["run"] and raw is None:
+        st.error(
+            "No data provided. Upload a file, paste CSV values, or choose a sample first."
+        )
+    if controls["run"] and raw is not None:
         try:
             with st.spinner("Running forecast and validation..."):
                 progress = st.empty()
@@ -203,9 +195,16 @@ def render_forecast_page(*, department_mode=False):
                 progress.empty()
             remember_data(raw, controls["source"], common, workflow, ran=True)
             st.session_state[f"{prefix}forecast_input_signature"] = signature
+            manifest = (
+                st.session_state["dept_manifest"]
+                if department_mode
+                else st.session_state["forecast_result"].run_manifest
+            )
+            st.session_state["latest_forecast"] = dict(
+                workflow=workflow, run_id=manifest["run_id"]
+            )
         except Exception as exc:
             st.error(f"Forecast failed: {exc}")
-            st.stop()
     if result_key in st.session_state and signature != st.session_state.get(
         f"{prefix}forecast_input_signature"
     ):

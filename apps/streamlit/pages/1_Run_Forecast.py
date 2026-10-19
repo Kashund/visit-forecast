@@ -6,4 +6,7 @@ from components.forecast_page import render_forecast_page
 
 st.set_page_config(page_title="Run Forecast", page_icon="🚀", layout="wide")
 st.title("🚀 Run Forecast")
-render_forecast_page()
+from components.session import persistent_page
+
+with persistent_page(""):
+    render_forecast_page()

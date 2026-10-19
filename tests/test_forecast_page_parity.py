@@ -184,6 +184,8 @@ def test_data_check_preserves_last_run_after_inputs_change(monkeypatch):
     assert app.warning
     app.switch_page("pages/2_Data_Check.py").run()
     assert not app.exception and not app.error
+    assert app.dataframe[0].value.Visits.tolist() == [777, 888]
+    app.selectbox(key="check_snapshot").select("Last run").run()
     pd.testing.assert_frame_equal(app.dataframe[0].value, expected.head(50))
     app.selectbox(key="check_snapshot").select("Current inputs").run()
     assert app.dataframe[0].value.Visits.tolist() == [777, 888]
