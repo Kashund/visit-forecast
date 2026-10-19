@@ -1,28 +1,80 @@
-from __future__ import annotations
-
 from bootstrap import ensure_project_paths
 import streamlit as st
 
 ensure_project_paths()
-from visit_forecast.io import inspect_data, read_data_file
+from components.data_sources import (
+    select_data_source,
+    preview_data,
+    selected_training_rows,
+)
+from visit_forecast.io import inspect_data
 
 st.set_page_config(page_title="Data Check", page_icon="✅", layout="wide")
 st.title("✅ Data Check")
-uploaded = st.file_uploader("Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"])
-if uploaded is None:
-    st.info(
-        "Upload a dataset to validate required columns and monthly department coverage."
-    )
-    st.stop()
+st.caption(
+    "Inspect the actual data from your latest forecast or current inputs, or choose an upload, pasted CSV, or sample to check."
+)
 try:
-    raw = read_data_file(uploaded)
+    source = select_data_source("check_", st, include_current=True)
+    if source.mode == "Use synthetic sample":
+        left, right = st.columns(2)
+        start = left.text_input(
+            "Sample start (YYYY-MM-DD)", "2020-04-01", key="check_start"
+        )
+        end = right.text_input("Sample end (YYYY-MM-DD)", "2025-03-01", key="check_end")
+    else:
+        start, end = "2020-04-01", "2025-03-01"
+    raw = source.resolve(start, end)
+except Exception as exc:
+    st.error(f"Could not read data: {exc}")
+    st.stop()
+if raw is None:
+    st.info("Choose a data source to preview and validate it.")
+    st.stop()
+
+settings = source.settings or {}
+if settings:
+    view = st.radio(
+        "Preview rows",
+        ["Rows selected for forecast", "Raw input"],
+        key="check_preview_rows",
+        horizontal=True,
+    )
+    try:
+        preview = (
+            selected_training_rows(raw, settings)
+            if view == "Rows selected for forecast"
+            else raw
+        )
+    except Exception as exc:
+        st.warning(
+            f"Could not apply the selected training window: {exc}. Showing raw input."
+        )
+        preview = raw
+    st.caption(
+        f"{len(preview):,} selected rows out of {len(raw):,} source rows. Validation below checks the complete source; invalid records are not silently removed."
+    )
+else:
+    preview = raw
+preview_data(
+    preview,
+    source.label,
+    filtered=bool(settings and view == "Rows selected for forecast"),
+)
+st.download_button(
+    "Download preview rows (CSV)",
+    preview.to_csv(index=False).encode(),
+    "data_preview.csv",
+    mime="text/csv",
+    key="check_download",
+)
+try:
     report = inspect_data(raw)
-    if report.valid:
-        st.session_state["shared_dataset"] = raw.copy()
 except Exception as exc:
     st.error(f"Data validation failed: {exc}")
     st.stop()
-st.dataframe(raw.head(30), width="stretch")
+if report.valid:
+    st.session_state["shared_dataset"] = raw.copy()
 if not report.valid:
     st.error(
         "This dataset is not forecast-ready. Invalid records are never silently discarded."

@@ -58,6 +58,8 @@ def generate_synthetic_data(
 
 def read_data_file(file) -> pd.DataFrame:
     """Read a supported path or uploaded file without guessing its format."""
+    if hasattr(file, "seek"):
+        file.seek(0)
     name = str(getattr(file, "name", file)).lower()
     suffix = Path(name).suffix
     if suffix == ".csv":

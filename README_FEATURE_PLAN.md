@@ -2,6 +2,14 @@
 
 Reviewed: 2026-10-19. Baseline: `main` at `d6afcf191f6208e40bad4580892362c16ac934aa`.
 
+## Follow-up — mirrored forecast pages and source previews
+
+Run Forecast and Department Forecasts now use one shared sidebar, workflow controller, and result renderer. Department forecasts forward capacity phases, target coverage, tuning mode, and joint tuning to the same forecasting engine. A department output selector updates every selected-result panel without fitting again; the combined overview remains available separately. Sidebar keys are scoped per page, preserving independent selections while exposing matching controls and defaults.
+
+Data Check now previews current inputs, the last completed run, or a workflow-specific run snapshot, as well as direct uploads, pasted CSV, generated data, and both bundled sample files. Previewed run rows can be filtered by the recorded training/department settings or shown raw. Source data is copied before validation so invalid records can be inspected, and uploaded streams can be reread safely across reruns. Scenario runs also register their source snapshot.
+
+Verification for this follow-up: the full suite passed **122 tests** (13 statsmodels warnings). A subsequent focused page pass passed **16 tests**, including source previews, cross-page navigation, selected department panels/download content, invalid-input inspection, and compatibility with previously shared session data. These counts overlap. The rebuilt installed wheel separately verified department capacity/coverage/tuning parameters. Compilation, undefined-name checks, and diff hygiene passed.
+
 ## Implementation status — 2026-10-19
 
 The original review below documents the baseline, not the current implementation. Application changes have now been implemented in this working tree; they are not committed, deployed, or published.

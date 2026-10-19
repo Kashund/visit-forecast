@@ -46,6 +46,18 @@ requested department succeeds and contributes to every forecast date. Otherwise 
 Programmatic access: `forecast_departments(...)` returns per-department results,
 a summary table, and the combined frame.
 
+## Matching forecast pages
+
+Run Forecast and Department Forecasts share the same sidebar configuration and result panels: data source/preview, training window, four capacity phases, model choice, the Include Prophet comparison option, calendar covariates, uncertainty/target coverage, manual or automatic tuning, department filters, exclusions, and run history. Both default to excluding Prophet from Auto comparison to keep initial comparisons faster; explicitly selecting Prophet still uses it.
+
+On Department Forecasts, choose All in the sidebar to fit each included department, then use **Department output** to switch the entire result view without refitting. Metrics, interval diagnostics, forecast/error-band chart, future table, fiscal monthly/quarterly/yearly views, run history, and Prophet CV/components (when applicable) all follow the selected department. Selected tables identify the department and selected downloads use department-specific filenames. An **All department outputs** expander retains the summary, combined chart, and complete-workbook exports.
+
+## Data Check previews
+
+Data Check can inspect **Current forecast data**, a new CSV/XLSX upload, pasted CSV, generated synthetic data, or either bundled sample CSV. Current forecast data defaults to the last completed run and also offers current inputs or a specific workflow's last run. Run inputs are copied into browser-session snapshots, so changing controls does not relabel an older forecast as using new data.
+
+The preview shows the first 50 rows, source name, and row counts, with CSV download of all preview rows. For a saved run, switch between **Rows selected for forecast** (training dates and department/exclusion filters) and **Raw input**. Validation still checks the complete source and reports invalid records and missing department-month observations. Failed inputs remain available for inspection as current inputs; the last successful run remains separate.
+
 ## Scenario comparison (page 4)
 The Scenario Comparison page fits the forecast once, then applies two capacity phase configurations (Scenario A and Scenario B) to the same fitted baseline, so differences between scenarios are purely the phase assumptions rather than refit noise. Phase-only reruns reuse the fitted baseline; changing data or baseline settings invalidates that reuse. Both scenarios support four phases, 100% loss, and additions above 100%. It shows a three-line chart (baseline, A, B), a monthly detail table with A minus Baseline, B minus Baseline, and A minus B deltas, fiscal year totals, and Excel export with Monthly_Comparison, FY_Summary, and Scenario_Definitions sheets. Programmatic access: `apply_capacity_phases_to_future_df(future_df, phases)` recomputes adjustments from `yhat_original`, so it never compounds on prior adjustments.
 

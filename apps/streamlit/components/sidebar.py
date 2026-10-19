@@ -3,17 +3,7 @@ from __future__ import annotations
 import hashlib
 import pandas as pd
 import streamlit as st
-from io import StringIO
-from visit_forecast.io import read_data_file
-
-
-@st.cache_data
-def _read_uploaded(file) -> pd.DataFrame:
-    return read_data_file(file)
-
-
-def _read_pasted_csv(text: str) -> pd.DataFrame:
-    return pd.read_csv(StringIO(text))
+from collections.abc import MutableMapping
 
 
 def _infer_timeframe_bounds(
@@ -52,7 +42,10 @@ def _source_signature(
         digest = hashlib.sha1(pasted_text.strip().encode("utf-8")).hexdigest()
         return f"paste:{digest}:{detected_start}:{detected_end}"
 
-    if source_mode == "Use shared dataset" and df_preview is not None:
+    if (
+        source_mode in {"Use shared dataset", "Use bundled sample"}
+        and df_preview is not None
+    ):
         return (
             "shared:"
             + hashlib.sha256(df_preview.to_csv(index=False).encode()).hexdigest()
@@ -98,65 +91,47 @@ def _resolve_joint_auto_tuning_state(
     return True, bool(session_state["joint_auto_tuning_enabled"])
 
 
-def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
-    st.sidebar.header("Inputs")
+class PrefixedState(MutableMapping):
+    def __init__(self, state, prefix):
+        self.state, self.prefix = state, prefix
 
+    def __getitem__(self, key):
+        return self.state[self.prefix + key]
+
+    def __setitem__(self, key, value):
+        self.state[self.prefix + key] = value
+
+    def __delitem__(self, key):
+        del self.state[self.prefix + key]
+
+    def __iter__(self):
+        return (
+            key[len(self.prefix) :] for key in self.state if key.startswith(self.prefix)
+        )
+
+    def __len__(self):
+        return sum(1 for _ in self)
+
+
+def sidebar_controls(prefix="") -> tuple[dict, pd.DataFrame | None]:
+    from components.data_sources import select_data_source
+
+    def key(name):
+        return f"{prefix}{name}"
+
+    state = PrefixedState(st.session_state, prefix)
+    st.sidebar.header("Inputs")
     st.sidebar.markdown("**Data source**")
-    source_mode = st.sidebar.radio(
-        "Choose how to provide data",
-        [
-            "Upload file",
-            "Paste values (CSV)",
-            "Use synthetic sample",
-            "Use shared dataset",
-        ],
-        index=0,
-        key="source_mode",
-        help="Upload Excel/CSV, paste raw CSV text, or use built-in synthetic data for testing.",
-        label_visibility="collapsed",
+    source = select_data_source(prefix, st.sidebar)
+    source_mode, uploaded, pasted_text, df_preview = (
+        source.mode,
+        source.uploaded,
+        source.pasted_text,
+        source.frame,
     )
 
-    uploaded = None
-    pasted_text = None
-    df_preview: pd.DataFrame | None = None
-
-    if source_mode == "Upload file":
-        uploaded = st.sidebar.file_uploader(
-            "Upload Excel (.xlsx) or CSV",
-            type=["xlsx", "csv"],
-            key="uploader",
-            help="File must include columns: Date, Visits, Department.",
-        )
-        if uploaded is not None:
-            df_preview = _read_uploaded(uploaded)
-
-    elif source_mode == "Paste values (CSV)":
-        st.sidebar.caption("Paste CSV with headers: Date, Visits, Department")
-        pasted_text = st.sidebar.text_area(
-            "CSV data",
-            height=180,
-            placeholder="Date,Visits,Department\n2020-04-01,120,Cardiology\n2020-05-01,130,Cardiology",
-            key="pasted_csv",
-            help="Paste CSV text exactly as shown (with headers).",
-        )
-        if pasted_text and pasted_text.strip():
-            df_preview = _read_pasted_csv(pasted_text)
-
-    elif source_mode == "Use shared dataset":
-        shared = st.session_state.get("shared_dataset")
-        if shared is not None:
-            df_preview = shared.copy()
-        else:
-            st.sidebar.info(
-                "No shared dataset yet. Upload data on Data Check or run a forecast first."
-            )
-    else:
-        st.sidebar.caption(
-            "Synthetic data includes: Cardiology, Oncology, Neurology (monthly)."
-        )
-
     _sync_timeframe_defaults(
-        st.session_state,
+        state,
         source_mode=source_mode,
         uploaded=uploaded,
         pasted_text=pasted_text,
@@ -169,13 +144,13 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     timeframe_start = st.sidebar.text_input(
         "Timeframe start (YYYY-MM-DD)",
         "2020-04-01",
-        key="start",
+        key=key("start"),
         help="Start date for the historical data used to train the model.",
     )
     timeframe_end = st.sidebar.text_input(
         "Timeframe end (YYYY-MM-DD)",
         "2025-03-01",
-        key="end",
+        key=key("end"),
         help="End date for the historical data used to train the model.",
     )
 
@@ -185,7 +160,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             1,
             36,
             12,
-            key="months",
+            key=key("months"),
             help="How many future months to predict beyond the last historical date.",
         )
     )
@@ -195,7 +170,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
 
     from components.phases import phase_editor
 
-    capacity_phases = phase_editor("phase", forecast_periods, st.sidebar)
+    capacity_phases = phase_editor(key("phase"), forecast_periods, st.sidebar)
 
     st.sidebar.divider()
     st.sidebar.markdown("**Forecast model**")
@@ -212,7 +187,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "Model",
         list(model_label_map.keys()),
         index=0,
-        key="model_choice",
+        key=key("model_choice"),
         help=(
             "Auto backtests every model (including a seasonal naive baseline) "
             "and picks the best balanced MAPE and RMSE. Prophet keeps the "
@@ -227,10 +202,18 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             "Prophet-only sections (Prophet CV, Prophet plots) will be empty."
         )
 
+    include_prophet = st.sidebar.checkbox(
+        "Include Prophet in auto comparison",
+        value=False,
+        key=key("include_prophet"),
+        disabled=model_choice != "auto",
+        help="Prophet can make automatic comparison and tuning considerably slower, especially for many departments.",
+    )
+
     use_calendar_covariates = st.sidebar.checkbox(
         "Calendar covariates (business days per month)",
         value=False,
-        key="use_calendar_covariates",
+        key=key("use_calendar_covariates"),
         help=(
             "Adds business days per month as a regressor. Months with more "
             "clinic days generate more visits, so this can explain "
@@ -246,7 +229,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "Uncertainty method",
         ["Auto-select", "Prophet interval", "Conformal calibrated"],
         horizontal=True,
-        key="uncertainty_method",
+        key=key("uncertainty_method"),
         help="Auto-select compares Prophet and conformal interval validation. Prophet interval uses model-based bounds. Conformal calibrated uses rolling forecast residuals to calibrate empirical coverage.",
     )
     if uncertainty_method_label == "Conformal calibrated":
@@ -262,7 +245,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.50,
             0.99,
             0.90,
-            key="target_coverage",
+            key=key("target_coverage"),
             help="Desired interval coverage. In Prophet mode this is the Prophet interval width; in conformal mode it is the empirical target coverage.",
         )
     )
@@ -275,7 +258,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         ["Auto-tune", "Manual"],
         index=0,
         horizontal=True,
-        key="parameter_selection_mode",
+        key=key("parameter_selection_mode"),
         help="Manual uses the sliders below. Auto-tune searches a moderate candidate set for this run.",
     )
     tuning_mode = "auto" if parameter_selection_mode == "Auto-tune" else "manual"
@@ -284,13 +267,13 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         st.sidebar.caption(
             "Auto-tune searches changepoint prior scale "
             "[0.01, 0.03, 0.05, 0.10, 0.20] by balancing MAPE and RMSE. "
-            "If Uncertainty method is Auto-select, the app performs a joint search across changepoint and uncertainty method. "
+            "Auto-select compares uncertainty methods at the requested coverage; the toggle chooses joint or separate evaluation. "
             "If Uncertainty method is set manually, the current interval / target coverage input is preserved for the run."
         )
 
     show_joint_auto_tuning_toggle, joint_auto_tuning_enabled = (
         _resolve_joint_auto_tuning_state(
-            st.session_state,
+            state,
             tuning_mode=tuning_mode,
             uncertainty_method=uncertainty_method,
         )
@@ -302,7 +285,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
             0.01,
             0.50,
             0.05,
-            key="cp",
+            key=key("cp"),
             help="Higher values allow the trend to change more aggressively (more flexible, higher overfit risk). Applies to Prophet only.",
             disabled=tuning_mode == "auto" or model_choice not in {"auto", "prophet"},
         )
@@ -313,7 +296,7 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         joint_auto_tuning_enabled = bool(
             toggle_fn(
                 "Joint Auto Tuning Evaluation",
-                key="joint_auto_tuning_enabled",
+                key=key("joint_auto_tuning_enabled"),
                 help=(
                     "On evaluates changepoint prior scale and uncertainty method together "
                     "in one joint search. Off auto-tunes changepoint first, then "
@@ -324,6 +307,9 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         st.sidebar.caption(
             "Displayed only when both Model tuning and Uncertainty method are set to auto."
         )
+
+    # Synthetic data must be materialized for previews and department options too.
+    df_preview = source.resolve(timeframe_start, timeframe_end)
 
     st.sidebar.divider()
     st.sidebar.markdown("**Filtering**")
@@ -344,17 +330,17 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "Department",
         dept_options,
         index=0,
-        key="dept",
-        help="Choose a single department or All to aggregate across included departments.",
+        key=key("dept"),
+        help="Choose a department or All included departments. Run Forecast fits the selected series; Department Forecasts fits each included department independently.",
     )
     exclude_departments = st.sidebar.multiselect(
         "Exclude departments",
         exclude_options,
-        key="exclude",
+        key=key("exclude"),
         help="Remove departments from the dataset before forecasting.",
     )
 
-    run = st.sidebar.button("Run forecast", type="primary", key="run_btn")
+    run = st.sidebar.button("Run forecast", type="primary", key=key("run_btn"))
 
     controls = {
         "source_mode": source_mode,
@@ -375,6 +361,10 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         "tuning_mode": tuning_mode,
         "joint_auto_tuning_enabled": joint_auto_tuning_enabled,
         "run": run,
+        "source": source,
+        "auto_candidates": None
+        if include_prophet
+        else ["ets", "theta", "arima", "seasonal_naive"],
     }
 
     return controls, df_preview

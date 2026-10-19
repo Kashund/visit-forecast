@@ -28,6 +28,7 @@ from visit_forecast.io import read_data_file
 from state import configuration_fingerprint, record_auxiliary_run
 from visit_forecast.exports import scenario_tables, excel_bytes
 from visit_forecast.provenance import build_run_manifest
+from components.data_sources import DataSource, remember_data
 
 
 def _phase_editor(scenario_key: str, forecast_periods: int) -> list[dict]:
@@ -138,6 +139,14 @@ if run_clicked:
             use_calendar_covariates=use_calendar_covariates,
             uncertainty_method="conformal",
         )
+        selected_source = DataSource(
+            source_mode,
+            uploaded.name
+            if uploaded is not None
+            else ("Pasted CSV" if source_mode == "Paste values (CSV)" else source_mode),
+            raw_df,
+        )
+        remember_data(raw_df, selected_source, baseline_inputs, "Scenario Comparison")
         signature = configuration_fingerprint(baseline_inputs, raw_df)
         if signature != st.session_state.get("cmp_baseline_signature"):
             with st.spinner("Fitting baseline forecast..."):
@@ -172,6 +181,9 @@ if run_clicked:
         )
         manifest["baseline_run"] = result.run_manifest
         st.session_state["cmp_manifest"] = manifest
+        remember_data(
+            raw_df, selected_source, baseline_inputs, "Scenario Comparison", ran=True
+        )
         record_auxiliary_run(st.session_state, "scenarios", manifest)
         st.session_state["cmp_scenarios"] = {
             "A": scenario_a_phases,

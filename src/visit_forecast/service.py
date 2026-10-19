@@ -1276,6 +1276,10 @@ def forecast_departments(
     changepoint_prior_scale: float = 0.05,
     interval_width: float = 0.90,
     progress_callback=None,
+    capacity_phases: Optional[List[CapacityPhase | dict[str, Any]]] = None,
+    target_coverage: Optional[float] = None,
+    tuning_mode: str = "manual",
+    joint_auto_tuning_enabled: bool = True,
 ) -> DepartmentForecastBundle:
     """Forecast each department independently with its own model selection.
 
@@ -1354,6 +1358,11 @@ def forecast_departments(
                 uncertainty_method=uncertainty_method,
                 changepoint_prior_scale=changepoint_prior_scale,
                 interval_width=interval_width,
+                capacity_phases=capacity_phases,
+                target_coverage=target_coverage,
+                tuning_mode=tuning_mode,
+                joint_auto_tuning_enabled=joint_auto_tuning_enabled,
+                exclude_departments=exclude_departments,
             )
             actual_dates = pd.DatetimeIndex(result.future_forecast_df["ds"])
             if not actual_dates.equals(expected_dates):

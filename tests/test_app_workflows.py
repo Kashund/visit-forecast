@@ -53,6 +53,7 @@ def test_scenario_four_phases_safe_ranges_and_baseline_reuse(monkeypatch):
 def test_department_workflow_exports_and_diagnostics(monkeypatch):
     monkeypatch.syspath_prepend(str(APP))
     app = AppTest.from_file(str(APP / "pages" / "3_Department_Forecasts.py")).run()
+    app.radio(key="dept_source_mode").set_value("Use synthetic sample")
     app.selectbox(key="dept_model_choice").select("Seasonal naive (baseline)")
     app.slider(key="dept_months").set_value(1)
     app.button(key="dept_run_btn").click().run(timeout=60)
