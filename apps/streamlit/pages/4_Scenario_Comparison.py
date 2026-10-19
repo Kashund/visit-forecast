@@ -15,9 +15,7 @@ from visit_forecast.service import (
     forecast_visits,
 )
 
-st.set_page_config(
-    page_title="Scenario Comparison", page_icon="⚖️", layout="wide"
-)
+st.set_page_config(page_title="Scenario Comparison", page_icon="⚖️", layout="wide")
 st.title("⚖️ Scenario Comparison")
 st.caption(
     "Fit the forecast once, then compare two capacity phase configurations "
@@ -25,44 +23,15 @@ st.caption(
     "same fitted model, so differences are purely the phase assumptions."
 )
 
-MAX_PHASES = 3
+from components.phases import phase_editor
+from visit_forecast.io import read_data_file
+from state import configuration_fingerprint, record_auxiliary_run
+from visit_forecast.exports import scenario_tables, excel_bytes
+from visit_forecast.provenance import build_run_manifest
 
 
 def _phase_editor(scenario_key: str, forecast_periods: int) -> list[dict]:
-    phases: list[dict] = []
-    for phase_number in range(1, MAX_PHASES + 1):
-        prefix = f"{scenario_key}_phase_{phase_number}"
-        with st.expander(f"Phase {phase_number}", expanded=phase_number == 1):
-            enabled = st.checkbox("Enable", key=f"{prefix}_enabled")
-            mode = st.selectbox(
-                "Mode", ["loss", "add"], key=f"{prefix}_mode", disabled=not enabled
-            )
-            percent = st.slider(
-                "Percent",
-                min_value=0,
-                max_value=50,
-                value=0,
-                key=f"{prefix}_percent",
-                disabled=not enabled,
-            )
-            month_range = st.slider(
-                "Apply between forecast months",
-                min_value=1,
-                max_value=forecast_periods,
-                value=(1, min(12, forecast_periods)),
-                key=f"{prefix}_between",
-                disabled=not enabled,
-            )
-        phases.append(
-            {
-                "enabled": bool(enabled),
-                "mode": str(mode),
-                "percent": float(percent),
-                "start_month": int(month_range[0]),
-                "end_month": int(month_range[1]),
-            }
-        )
-    return phases
+    return phase_editor(f"{scenario_key}_phase", forecast_periods)
 
 
 def _scenario_summary(phases: list[dict]) -> str:
@@ -78,7 +47,14 @@ def _scenario_summary(phases: list[dict]) -> str:
 with st.sidebar:
     st.markdown("**Baseline forecast**")
     source_mode = st.radio(
-        "Source", ["Use synthetic sample", "Upload file"], key="cmp_source_mode"
+        "Source",
+        [
+            "Use synthetic sample",
+            "Upload file",
+            "Paste values (CSV)",
+            "Use shared dataset",
+        ],
+        key="cmp_source_mode",
     )
     uploaded = None
     if source_mode == "Upload file":
@@ -87,14 +63,17 @@ with st.sidebar:
             type=["xlsx", "csv"],
             key="cmp_upload",
         )
+    pasted = (
+        st.text_area("CSV data", key="cmp_pasted")
+        if source_mode == "Paste values (CSV)"
+        else ""
+    )
     timeframe_start = st.text_input(
         "Start (YYYY-MM-DD)", value="2020-04-01", key="cmp_start"
     )
-    timeframe_end = st.text_input(
-        "End (YYYY-MM-DD)", value="2025-03-01", key="cmp_end"
-    )
+    timeframe_end = st.text_input("End (YYYY-MM-DD)", value="2025-03-01", key="cmp_end")
     forecast_periods = st.slider(
-        "Forecast months", min_value=1, max_value=24, value=12, key="cmp_months"
+        "Forecast months", min_value=1, max_value=36, value=12, key="cmp_months"
     )
     model_label_map = {
         "Auto (compare models)": "auto",
@@ -102,11 +81,21 @@ with st.sidebar:
         "Holt-Winters (ETS)": "ets",
         "Theta": "theta",
         "SARIMA": "arima",
+        "Seasonal naive (baseline)": "seasonal_naive",
     }
     model_choice_label = st.selectbox(
         "Model", list(model_label_map.keys()), index=0, key="cmp_model_choice"
     )
     model_choice = model_label_map[model_choice_label]
+    use_calendar_covariates = st.checkbox(
+        "Calendar covariates (business days per month)", key="cmp_covariates"
+    )
+    department = st.text_input(
+        "Department (All or exact name)", value="All", key="cmp_department"
+    )
+    exclusions = st.text_input(
+        "Exclude departments (comma separated)", key="cmp_exclusions"
+    )
     run_clicked = st.button("Run comparison", key="cmp_run_btn")
 
 # --- Scenario phase editors ---
@@ -126,25 +115,64 @@ if run_clicked:
                 st.info("Upload a dataset to run the comparison.")
                 st.stop()
             name = uploaded.name.lower()
-            raw_df = (
-                pd.read_csv(uploaded)
-                if name.endswith(".csv")
-                else pd.read_excel(uploaded)
-            )
+            raw_df = read_data_file(uploaded)
+        elif source_mode == "Paste values (CSV)":
+            raw_df = pd.read_csv(_io.StringIO(pasted))
+        elif source_mode == "Use shared dataset":
+            if "shared_dataset" not in st.session_state:
+                st.info(
+                    "Run a forecast or upload data on Data Check to share a dataset."
+                )
+                st.stop()
+            raw_df = st.session_state["shared_dataset"].copy()
         else:
             raw_df = generate_synthetic_data(timeframe_start, timeframe_end)
 
-        with st.spinner("Fitting baseline forecast..."):
-            result = forecast_visits(
-                df=raw_df,
-                timeframe_start=timeframe_start,
-                timeframe_end=timeframe_end,
-                forecast_periods=int(forecast_periods),
-                department="All",
-                model_choice=model_choice,
-                uncertainty_method="conformal",
-            )
-        st.session_state["cmp_result"] = result
+        baseline_inputs = dict(
+            timeframe_start=timeframe_start,
+            timeframe_end=timeframe_end,
+            forecast_periods=int(forecast_periods),
+            department=department,
+            model_choice=model_choice,
+            exclude_departments=[d.strip() for d in exclusions.split(",") if d.strip()],
+            use_calendar_covariates=use_calendar_covariates,
+            uncertainty_method="conformal",
+        )
+        signature = configuration_fingerprint(baseline_inputs, raw_df)
+        if signature != st.session_state.get("cmp_baseline_signature"):
+            with st.spinner("Fitting baseline forecast..."):
+                result = forecast_visits(df=raw_df, **baseline_inputs)
+            st.session_state["cmp_result"] = result
+            st.session_state["cmp_baseline_signature"] = signature
+        else:
+            result = st.session_state["cmp_result"]
+        st.session_state["cmp_used_controls"] = (
+            timeframe_start,
+            timeframe_end,
+            forecast_periods,
+            model_choice,
+            use_calendar_covariates,
+            department,
+            exclusions,
+            source_mode,
+            configuration_fingerprint({}, raw_df),
+        )
+        st.session_state["shared_dataset"] = raw_df.copy()
+        st.session_state["cmp_source_fingerprint"] = (
+            pasted,
+            uploaded.getvalue() if uploaded else None,
+        )
+        manifest = build_run_manifest(
+            raw_df,
+            {
+                **baseline_inputs,
+                "scenarios": {"A": scenario_a_phases, "B": scenario_b_phases},
+            },
+            result.evaluation_summary,
+        )
+        manifest["baseline_run"] = result.run_manifest
+        st.session_state["cmp_manifest"] = manifest
+        record_auxiliary_run(st.session_state, "scenarios", manifest)
         st.session_state["cmp_scenarios"] = {
             "A": scenario_a_phases,
             "B": scenario_b_phases,
@@ -158,6 +186,40 @@ scenarios = st.session_state.get("cmp_scenarios")
 if result is None or scenarios is None:
     st.info("Configure both scenarios, then click Run comparison in the sidebar.")
     st.stop()
+
+if scenarios != {"A": scenario_a_phases, "B": scenario_b_phases}:
+    st.warning(
+        "Scenario controls have changed. Click Run comparison to apply; the baseline is reused when its settings are unchanged."
+    )
+used = st.session_state.get("cmp_used_controls", ())
+current = (
+    timeframe_start,
+    timeframe_end,
+    forecast_periods,
+    model_choice,
+    use_calendar_covariates,
+    department,
+    exclusions,
+    source_mode,
+)
+shared_changed = (
+    source_mode == "Use shared dataset"
+    and "shared_dataset" in st.session_state
+    and used
+    and used[-1] != configuration_fingerprint({}, st.session_state["shared_dataset"])
+)
+if (
+    shared_changed
+    or used[:8] != current
+    or st.session_state.get("cmp_source_fingerprint")
+    != (
+        pasted,
+        uploaded.getvalue() if uploaded else None,
+    )
+):
+    st.warning(
+        "Baseline settings have changed. Displayed results use the previous run; click Run comparison to update."
+    )
 
 baseline_df = result.future_forecast_df
 scenario_a_df = apply_capacity_phases_to_future_df(baseline_df, scenarios["A"])
@@ -173,91 +235,64 @@ st.subheader("Monthly forecast comparison")
 fig = go.Figure()
 fig.add_trace(
     go.Scatter(
-        x=baseline_df["ds"], y=baseline_df["yhat_original"],
-        mode="lines", name="Baseline (no adjustments)",
+        x=baseline_df["ds"],
+        y=baseline_df["yhat_original"],
+        mode="lines",
+        name="Baseline (no adjustments)",
         line=dict(color="gray", dash="dot"),
     )
 )
 fig.add_trace(
     go.Scatter(
-        x=scenario_a_df["ds"], y=scenario_a_df["yhat_adjusted"],
-        mode="lines+markers", name="Scenario A",
+        x=scenario_a_df["ds"],
+        y=scenario_a_df["yhat_adjusted"],
+        mode="lines+markers",
+        name="Scenario A",
     )
 )
 fig.add_trace(
     go.Scatter(
-        x=scenario_b_df["ds"], y=scenario_b_df["yhat_adjusted"],
-        mode="lines+markers", name="Scenario B",
+        x=scenario_b_df["ds"],
+        y=scenario_b_df["yhat_adjusted"],
+        mode="lines+markers",
+        name="Scenario B",
     )
 )
 fig.update_layout(hovermode="x unified", xaxis_title="Date", yaxis_title="Visits")
 st.plotly_chart(fig, width="stretch")
 
 # --- Comparison tables ---
-comparison_df = pd.DataFrame(
-    {
-        "ds": baseline_df["ds"],
-        "Fiscal_Year": baseline_df["Fiscal_Year"],
-        "forecast_month": baseline_df["forecast_month"],
-        "Baseline": baseline_df["yhat_original"].round(1),
-        "Scenario_A": scenario_a_df["yhat_adjusted"].round(1),
-        "Scenario_B": scenario_b_df["yhat_adjusted"].round(1),
-    }
+comparison_df, fy_summary, definitions_df = scenario_tables(
+    result, scenarios["A"], scenarios["B"]
 )
-comparison_df["A_minus_Baseline"] = (
-    comparison_df["Scenario_A"] - comparison_df["Baseline"]
-).round(1)
-comparison_df["B_minus_Baseline"] = (
-    comparison_df["Scenario_B"] - comparison_df["Baseline"]
-).round(1)
-comparison_df["A_minus_B"] = (
-    comparison_df["Scenario_A"] - comparison_df["Scenario_B"]
-).round(1)
-
 st.subheader("Monthly detail")
 st.dataframe(comparison_df, width="stretch")
-
-fy_summary = (
-    comparison_df.groupby("Fiscal_Year", as_index=False)[
-        ["Baseline", "Scenario_A", "Scenario_B"]
-    ]
-    .sum()
-    .round(0)
-)
-fy_summary["A_minus_Baseline"] = fy_summary["Scenario_A"] - fy_summary["Baseline"]
-fy_summary["B_minus_Baseline"] = fy_summary["Scenario_B"] - fy_summary["Baseline"]
-fy_summary["A_minus_B"] = fy_summary["Scenario_A"] - fy_summary["Scenario_B"]
 
 st.subheader("Fiscal year totals")
 st.dataframe(fy_summary, width="stretch")
 
 # --- Export ---
-definitions_df = pd.DataFrame(
-    [
-        {"Scenario": "A", "Definition": summary_a},
-        {"Scenario": "B", "Definition": summary_b},
-        {
-            "Scenario": "Model",
-            "Definition": getattr(result, "selected_model", "prophet"),
-        },
-    ]
+export = excel_bytes(
+    {
+        "Monthly_Comparison": comparison_df,
+        "FY_Summary": fy_summary,
+        "Scenario_Definitions": definitions_df,
+    },
+    st.session_state.get("cmp_manifest"),
 )
-export_buffer = _io.BytesIO()
-with pd.ExcelWriter(export_buffer, engine="openpyxl") as writer:
-    comparison_df.to_excel(writer, sheet_name="Monthly_Comparison", index=False)
-    fy_summary.to_excel(writer, sheet_name="FY_Summary", index=False)
-    definitions_df.to_excel(writer, sheet_name="Scenario_Definitions", index=False)
 st.download_button(
     "Download scenario comparison (Excel)",
-    data=export_buffer.getvalue(),
-    file_name="scenario_comparison.xlsx",
+    export,
+    "scenario_comparison.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     key="cmp_download_xlsx",
 )
 st.download_button(
     "Download monthly comparison (CSV)",
-    data=comparison_df.to_csv(index=False).encode("utf-8"),
-    file_name="scenario_comparison.csv",
+    comparison_df.to_csv(index=False).encode(),
+    "scenario_comparison.csv",
     mime="text/csv",
     key="cmp_download_csv",
 )
+if st.session_state.get("history_save_error"):
+    st.warning(st.session_state["history_save_error"])

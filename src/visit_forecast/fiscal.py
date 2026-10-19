@@ -29,33 +29,23 @@ def add_fiscal_quarter(df: pd.DataFrame, date_col: str = "ds") -> pd.DataFrame:
 def aggregate_summary_by_period(
     hist_df: pd.DataFrame,
     future_df: pd.DataFrame,
-    period: Literal["year", "quarter"] = "year",
+    period: Literal["month", "quarter", "year"] = "year",
 ) -> pd.DataFrame:
-    if period == "year":
-        history_with_period = add_fiscal_year(hist_df, "ds")
-        forecast_with_period = add_fiscal_year(future_df, "ds")
-        grouping_columns = ["Fiscal_Year"]
-        sorting_columns = ["Fiscal_Year"]
-    elif period == "quarter":
-        history_with_period = add_fiscal_quarter(hist_df, "ds")
-        forecast_with_period = add_fiscal_quarter(future_df, "ds")
-        grouping_columns = ["Fiscal_Year", "Fiscal_Quarter", "Fiscal_Period_Label"]
-        sorting_columns = ["Fiscal_Year", "Fiscal_Quarter"]
-    else:
-        raise ValueError("period must be either 'year' or 'quarter'")
+    """Roll up the same monthly values and disclose partial fiscal coverage.
 
-    historical_aggregated = (
-        history_with_period.groupby(grouping_columns)["y"]
-        .sum()
-        .reset_index()
-        .rename(columns={"y": "Historical_Visits"})
-    )
-    forecast_aggregated = (
-        forecast_with_period.groupby(grouping_columns)[
-            ["yhat_original", "yhat_adjusted"]
-        ]
-        .sum()
-        .reset_index()
+    A missing observation remains unavailable. Zero visits are real observations.
+    Historical and forecast alternatives are always kept separate.
+    """
+    if period not in {"month", "quarter", "year"}:
+        raise ValueError("period must be either 'month', 'quarter', or 'year'")
+    history = hist_df[["ds", "y"]].copy()
+    forecast = future_df[["ds", "yhat_original", "yhat_adjusted"]].copy()
+    for frame in (history, forecast):
+        frame["ds"] = pd.to_datetime(frame["ds"]).dt.to_period("M").dt.to_timestamp()
+    history = history.groupby("ds")["y"].sum(min_count=1).rename("Historical_Visits")
+    forecast = (
+        forecast.groupby("ds")[["yhat_original", "yhat_adjusted"]]
+        .sum(min_count=1)
         .rename(
             columns={
                 "yhat_original": "Forecast_Original",
@@ -63,12 +53,51 @@ def aggregate_summary_by_period(
             }
         )
     )
-
-    merged_summary = pd.merge(
-        historical_aggregated, forecast_aggregated, on=grouping_columns, how="outer"
-    ).fillna(0)
-    merged_summary = merged_summary.sort_values(sorting_columns).reset_index(drop=True)
-    return merged_summary
+    monthly = pd.concat([history, forecast], axis=1).sort_index()
+    if monthly.empty:
+        return pd.DataFrame(
+            columns=[
+                "Fiscal_Year",
+                "Historical_Visits",
+                "Forecast_Original",
+                "Forecast_Adjusted",
+            ]
+        )
+    monthly = monthly.reindex(
+        pd.date_range(monthly.index.min(), monthly.index.max(), freq="MS")
+    )
+    monthly.index.name = "ds"
+    monthly = add_fiscal_quarter(monthly.reset_index())
+    monthly["Fiscal_Month"] = ((monthly.ds.dt.month - 4) % 12) + 1
+    monthly["Historical_Months"] = monthly.Historical_Visits.notna().astype(int)
+    monthly["Forecast_Months"] = monthly.Forecast_Original.notna().astype(int)
+    monthly["Covered_Months"] = (
+        monthly.Historical_Visits.notna() | monthly.Forecast_Original.notna()
+    ).astype(int)
+    if period == "month":
+        monthly["Fiscal_Period_Label"] = (
+            "FY"
+            + monthly.Fiscal_Year.astype(str)
+            + " M"
+            + monthly.Fiscal_Month.astype(str).str.zfill(2)
+            + " ("
+            + monthly.ds.dt.strftime("%b %Y")
+            + ")"
+        )
+        keys = ["Fiscal_Year", "Fiscal_Month", "Fiscal_Period_Label"]
+    elif period == "quarter":
+        keys = ["Fiscal_Year", "Fiscal_Quarter", "Fiscal_Period_Label"]
+    else:
+        keys = ["Fiscal_Year"]
+    values = ["Historical_Visits", "Forecast_Original", "Forecast_Adjusted"]
+    counts = ["Historical_Months", "Forecast_Months", "Covered_Months"]
+    grouped = monthly.groupby(keys, sort=True)
+    out = grouped[values].sum(min_count=1).join(grouped[counts].sum()).reset_index()
+    out["Period_Months"] = {"month": 1, "quarter": 3, "year": 12}[period]
+    out["Coverage_Status"] = np.where(
+        out.Covered_Months.eq(out.Period_Months), "Complete", "Partial"
+    )
+    return out
 
 
 def append_fiscal_year_totals(quarter_summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -84,31 +113,42 @@ def append_fiscal_year_totals(quarter_summary_df: pd.DataFrame) -> pd.DataFrame:
     if missing_columns:
         missing_columns_list = ", ".join(sorted(missing_columns))
         raise ValueError(
-            "quarter_summary_df is missing required columns: "
-            f"{missing_columns_list}"
+            f"quarter_summary_df is missing required columns: {missing_columns_list}"
         )
 
     if quarter_summary_df.empty:
         return quarter_summary_df.copy()
 
     value_columns = [
-        "Historical_Visits",
-        "Forecast_Original",
-        "Forecast_Adjusted",
+        name
+        for name in [
+            "Historical_Visits",
+            "Forecast_Original",
+            "Forecast_Adjusted",
+            "Historical_Months",
+            "Forecast_Months",
+            "Covered_Months",
+        ]
+        if name in quarter_summary_df
     ]
 
     detail_rows = quarter_summary_df.copy()
     detail_rows["Fiscal_Quarter"] = detail_rows["Fiscal_Quarter"].astype("Int64")
     detail_rows["_sort_order"] = detail_rows["Fiscal_Quarter"]
 
-    total_rows = (
-        detail_rows.groupby("Fiscal_Year", as_index=False)[value_columns].sum()
+    total_rows = detail_rows.groupby("Fiscal_Year", as_index=False)[value_columns].sum(
+        min_count=1
     )
     total_rows["Fiscal_Quarter"] = pd.Series([pd.NA] * len(total_rows), dtype="Int64")
     total_rows["Fiscal_Period_Label"] = (
         "FY" + total_rows["Fiscal_Year"].astype(int).astype(str) + " Total"
     )
     total_rows["_sort_order"] = 5
+    if "Period_Months" in detail_rows:
+        total_rows["Period_Months"] = 12
+        total_rows["Coverage_Status"] = np.where(
+            total_rows.Covered_Months.eq(12), "Complete", "Partial"
+        )
 
     combined_summary = pd.concat(
         [detail_rows, total_rows[detail_rows.columns]], ignore_index=True

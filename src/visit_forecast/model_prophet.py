@@ -13,12 +13,22 @@ def fit_and_forecast(
     forecast_periods: int,
     changepoint_prior_scale: float,
     interval_width: float,
+    future_covariates: Optional[TimeSeries] = None,
 ) -> tuple[TimeSeries, TimeSeries, Prophet]:
     """Fit Darts Prophet and produce a point forecast."""
     series = TimeSeries.from_dataframe(df_prepared, time_col="ds", value_cols="y")
-    model = Prophet(changepoint_prior_scale=changepoint_prior_scale, interval_width=interval_width)
-    model.fit(series)
-    forecast = model.predict(forecast_periods)
+    model = Prophet(
+        changepoint_prior_scale=changepoint_prior_scale, interval_width=interval_width
+    )
+    covariates = (
+        {"future_covariates": future_covariates}
+        if future_covariates is not None
+        else {}
+    )
+    model.fit(series, **covariates)
+    forecast = model.predict(forecast_periods, **covariates).map(
+        lambda values: np.maximum(values, 0.0)
+    )
     return series, forecast, model
 
 
@@ -42,11 +52,11 @@ def prophet_future_intervals(
         merge_df["ds"] = pd.to_datetime(merge_df["ds"])
         future = future.merge(merge_df, on="ds", how="left")
 
-    required_regressors = list(
-        getattr(model.model, "extra_regressors", {}).keys()
-    )
+    required_regressors = list(getattr(model.model, "extra_regressors", {}).keys())
     missing_regressors = [
-        regressor for regressor in required_regressors if regressor not in future.columns
+        regressor
+        for regressor in required_regressors
+        if regressor not in future.columns
     ]
     if missing_regressors:
         raise ValueError(
@@ -54,9 +64,7 @@ def prophet_future_intervals(
             + ", ".join(missing_regressors)
         )
     null_regressors = [
-        regressor
-        for regressor in required_regressors
-        if future[regressor].isna().any()
+        regressor for regressor in required_regressors if future[regressor].isna().any()
     ]
     if null_regressors:
         raise ValueError(
@@ -77,7 +85,9 @@ def _timeseries_to_df(ts) -> pd.DataFrame:
         return ts.to_dataframe()
     if hasattr(ts, "pandas_dataframe"):
         return ts.pandas_dataframe()
-    raise AttributeError("Unsupported Darts TimeSeries version: cannot convert to DataFrame.")
+    raise AttributeError(
+        "Unsupported Darts TimeSeries version: cannot convert to DataFrame."
+    )
 
 
 def _standardize_series_dataframe(ts) -> pd.DataFrame:
@@ -126,6 +136,7 @@ def _generate_historical_forecasts(
     stride: Optional[int] = None,
     last_points_only: bool = True,
     future_covariates: Optional[TimeSeries] = None,
+    strict_protocol: bool = False,
 ):
     stride = stride or forecast_horizon
 
@@ -151,6 +162,8 @@ def _generate_historical_forecasts(
     try:
         return model.historical_forecasts(series, **base_kwargs)
     except ValueError:
+        if strict_protocol:
+            raise
         retry_start = (
             max(0.0, adj_start - 0.05) if isinstance(adj_start, float) else adj_start
         )
@@ -190,7 +203,9 @@ def _collect_forecast_alignment_rows(
     fc_list = _normalize_forecast_list(forecasts)
     rows: list[dict[str, Any]] = []
     for fc in fc_list:
-        fc_df = _standardize_series_dataframe(fc).sort_values("ds").reset_index(drop=True)
+        fc_df = (
+            _standardize_series_dataframe(fc).sort_values("ds").reset_index(drop=True)
+        )
         if fc_df.empty:
             continue
 
@@ -205,7 +220,7 @@ def _collect_forecast_alignment_rows(
             if pd.isna(actual_value):
                 continue
 
-            predicted_value = float(yhat)
+            predicted_value = max(float(yhat), 0.0)
             actual_float = float(actual_value)
             residual = actual_float - predicted_value
             rows.append(
@@ -297,9 +312,17 @@ def _partition_conformal_residuals(
     )
     evaluation_cutoffs = set(cutoff_values[-evaluation_count:])
     cutoff_series = pd.to_datetime(partitioned["cutoff"], errors="coerce")
-    partitioned.loc[
-        cutoff_series.isin(evaluation_cutoffs), "conformal_partition"
-    ] = "evaluation"
+    partitioned.loc[cutoff_series.isin(evaluation_cutoffs), "conformal_partition"] = (
+        "evaluation"
+    )
+    # Outcomes after the first evaluation origin would not yet be observable
+    # when that interval is issued. Purge those rows, including shared targets.
+    if "ds" in partitioned:
+        boundary = min(evaluation_cutoffs)
+        purge = partitioned["conformal_partition"].eq("calibration") & pd.to_datetime(
+            partitioned["ds"]
+        ).gt(boundary)
+        partitioned.loc[purge, "conformal_partition"] = "purged"
     return partitioned
 
 
@@ -309,6 +332,8 @@ def build_conformal_intervals(
     target_coverage: float,
     min_residuals_per_horizon: int = 8,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+    if not np.isfinite(target_coverage) or not 0 < target_coverage < 1:
+        raise ValueError("target_coverage must be strictly between 0 and 1.")
     output_df = future_df.copy()
     output_df["yhat_lower_conformal"] = np.nan
     output_df["yhat_upper_conformal"] = np.nan
@@ -322,9 +347,7 @@ def build_conformal_intervals(
             residuals_df["conformal_partition"].eq("evaluation")
         ].copy()
         validation_mode = (
-            "held_out_cutoffs"
-            if not evaluation_residuals_df.empty
-            else "unavailable"
+            "held_out_cutoffs" if not evaluation_residuals_df.empty else "unavailable"
         )
     else:
         # Backward-compatible low-level behavior for callers that provide their
@@ -365,9 +388,7 @@ def build_conformal_intervals(
     upper_quantile = min(1.0, 1.0 - (alpha / 2.0))
 
     abs_residuals = (
-        pd.to_numeric(
-            calibration_residuals_df.get("abs_residual"), errors="coerce"
-        )
+        pd.to_numeric(calibration_residuals_df.get("abs_residual"), errors="coerce")
         .dropna()
         .to_numpy(dtype=float)
     )
@@ -383,19 +404,17 @@ def build_conformal_intervals(
     max_horizon = int(output_df["forecast_month"].max())
     for horizon_step in range(1, max_horizon + 1):
         calibration_horizon_rows = calibration_residuals_df[
-            pd.to_numeric(
-                calibration_residuals_df["horizon_step"], errors="coerce"
-            ).eq(horizon_step)
+            pd.to_numeric(calibration_residuals_df["horizon_step"], errors="coerce").eq(
+                horizon_step
+            )
         ].copy()
         evaluation_horizon_rows = evaluation_residuals_df[
-            pd.to_numeric(
-                evaluation_residuals_df["horizon_step"], errors="coerce"
-            ).eq(horizon_step)
+            pd.to_numeric(evaluation_residuals_df["horizon_step"], errors="coerce").eq(
+                horizon_step
+            )
         ].copy()
         horizon_residuals = (
-            pd.to_numeric(
-                calibration_horizon_rows.get("residual"), errors="coerce"
-            )
+            pd.to_numeric(calibration_horizon_rows.get("residual"), errors="coerce")
             .dropna()
             .to_numpy(dtype=float)
         )
@@ -430,9 +449,10 @@ def build_conformal_intervals(
                 a_min=0.0,
                 a_max=None,
             )
-            upper_bound = (
+            upper_bound = np.maximum(
                 evaluation_horizon_rows["predicted"].to_numpy(dtype=float)
-                + upper_offset
+                + upper_offset,
+                lower_bound,
             )
             actual_values = evaluation_horizon_rows["actual"].to_numpy(dtype=float)
             empirical_coverage = float(
@@ -445,9 +465,7 @@ def build_conformal_intervals(
         diagnostics_rows.append(
             {
                 "horizon_step": horizon_step,
-                "n_calibration_forecasts": int(
-                    calibration_horizon_rows.shape[0]
-                ),
+                "n_calibration_forecasts": int(calibration_horizon_rows.shape[0]),
                 "n_evaluation_forecasts": int(evaluation_horizon_rows.shape[0]),
                 "target_coverage": float(target_coverage),
                 "empirical_coverage": empirical_coverage,
@@ -470,7 +488,10 @@ def build_conformal_intervals(
                 a_max=None,
             )
         if np.isfinite(upper_offset):
-            output_df.loc[month_mask, "yhat_upper_conformal"] = base_forecast + upper_offset
+            output_df.loc[month_mask, "yhat_upper_conformal"] = np.maximum(
+                base_forecast + upper_offset,
+                output_df.loc[month_mask, "yhat_lower_conformal"],
+            )
 
     diagnostics_df = pd.DataFrame(diagnostics_rows)
 
@@ -497,7 +518,7 @@ def build_conformal_intervals(
             continue
 
         lower_bound = max(float(row.predicted) + lower_offset, 0.0)
-        upper_bound = float(row.predicted) + upper_offset
+        upper_bound = max(float(row.predicted) + upper_offset, lower_bound)
         summary_rows.append(
             {
                 "covered": float(lower_bound <= float(row.actual) <= upper_bound),
@@ -518,9 +539,7 @@ def build_conformal_intervals(
         median_interval_width = float(summary_df["interval_width"].median())
         mean_actual = float(summary_df["actual"].mean())
         interval_width_over_mean_actual = (
-            float(avg_interval_width / mean_actual)
-            if mean_actual > 0
-            else float("nan")
+            float(avg_interval_width / mean_actual) if mean_actual > 0 else float("nan")
         )
 
     coverage_by_horizon = (
@@ -552,6 +571,7 @@ def backtest(
     start: Union[float, pd.Timestamp] = 0.7,
     stride: Optional[int] = None,
     future_covariates: Optional[TimeSeries] = None,
+    strict_protocol: bool = False,
 ) -> Dict[str, float]:
     """Run historical forecasts and compute MAPE/MAE/RMSE.
 
@@ -569,6 +589,7 @@ def backtest(
         # error per forecasted month.
         last_points_only=False,
         future_covariates=future_covariates,
+        **({"strict_protocol": True} if strict_protocol else {}),
     )
 
     aligned_rows = _collect_forecast_alignment_rows(series, bt)
@@ -577,14 +598,22 @@ def backtest(
 
     abs_errors = aligned_rows["residual"].abs().to_numpy(dtype=float)
     mae_v = float(np.mean(abs_errors))
-    rmse_v = float(np.sqrt(np.mean(np.square(aligned_rows["residual"].to_numpy(dtype=float)))))
+    rmse_v = float(
+        np.sqrt(np.mean(np.square(aligned_rows["residual"].to_numpy(dtype=float))))
+    )
 
     non_zero_actuals = aligned_rows["actual"].replace(0, np.nan)
     ape = (aligned_rows["residual"].abs() / non_zero_actuals.abs()).dropna()
     mape_v = float(ape.mean() * 100.0) if not ape.empty else float("nan")
 
-    return {"MAPE": mape_v, "MAE": mae_v, "RMSE": rmse_v}
-
+    return {
+        "MAPE": mape_v,
+        "MAE": mae_v,
+        "RMSE": rmse_v,
+        "n_scored": len(aligned_rows),
+        "n_zero_actuals": int(aligned_rows.actual.eq(0).sum()),
+        "n_cutoffs": int(aligned_rows.cutoff.nunique()),
+    }
 
 
 def prophet_full_forecast_df(
@@ -601,7 +630,9 @@ def prophet_full_forecast_df(
     Prophet's predict call has the values it needs.
     """
     # Prophet's make_future_dataframe includes history by default
-    future = model.model.make_future_dataframe(periods=int(forecast_periods), freq=freq, include_history=True)
+    future = model.model.make_future_dataframe(
+        periods=int(forecast_periods), freq=freq, include_history=True
+    )
     if covariates_df is not None:
         merge_df = covariates_df.copy()
         merge_df["ds"] = pd.to_datetime(merge_df["ds"])
@@ -629,7 +660,9 @@ def prophet_cross_validation_metrics(
 
     # Prophet CV can fail if initial/horizon don't fit the data length. We'll catch and return None.
     try:
-        df_cv = cross_validation(model.model, initial=initial, period=period, horizon=horizon)
+        df_cv = cross_validation(
+            model.model, initial=initial, period=period, horizon=horizon
+        )
         df_p = performance_metrics(df_cv)
         return df_cv, df_p
     except Exception:

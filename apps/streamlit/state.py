@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime
+import tempfile
+import warnings
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, MutableMapping
+
+from visit_forecast.provenance import configuration_fingerprint, json_safe
 
 HISTORY_LIMIT = 20
 
@@ -51,20 +56,62 @@ def load_persisted_history() -> list[dict[str, Any]]:
     return []
 
 
-def save_persisted_history(history: list[dict[str, Any]]) -> None:
-    """Persist run history to disk. Failures are silent by design; the
-    in-session history still works even if the disk write fails."""
+@contextmanager
+def _history_lock(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_suffix(".lock").open("a") as lock:
+        try:
+            import fcntl
+        except ImportError:
+            fcntl = None
+        if fcntl:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def save_persisted_history(history: list[dict[str, Any]]) -> str | None:
     if not history_persistence_enabled():
-        return
+        return None
     try:
         path = history_file_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(history[:HISTORY_LIMIT], default=str, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
+        with _history_lock(path):
+            existing = load_persisted_history()
+            seen, merged = set(), []
+            for entry in history + existing:
+                key = entry.get("run_id") or configuration_fingerprint(entry)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(entry)
+            merged.sort(key=lambda x: str(x.get("run_time", "")), reverse=True)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=path.parent, delete=False
+                ) as temp:
+                    temp_path = Path(temp.name)
+                    temp.write(
+                        json.dumps(
+                            json_safe(merged[:HISTORY_LIMIT]),
+                            default=str,
+                            indent=2,
+                            allow_nan=False,
+                        )
+                    )
+                    temp.flush()
+                    os.fsync(temp.fileno())
+                temp_path.replace(path)
+            finally:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink()
+    except Exception as exc:
+        message = f"History remains in this session but could not be saved: {exc}"
+        warnings.warn(message, RuntimeWarning)
+        return message
+    return None
 
 
 def clear_persisted_history() -> None:
@@ -72,8 +119,9 @@ def clear_persisted_history() -> None:
         return
     try:
         path = history_file_path()
-        if path.exists():
-            path.unlink()
+        with _history_lock(path):
+            if path.exists():
+                path.unlink()
     except Exception:
         pass
 
@@ -109,8 +157,13 @@ def build_forecast_history_entry(
     scenario_summary: str,
     run_time: str | None = None,
 ) -> dict[str, Any]:
+    manifest = getattr(result, "run_manifest", None) or {}
     entry = {
-        "run_time": run_time or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "run_id": manifest.get("run_id"),
+        "workflow": "forecast",
+        "schema_version": 1,
+        "data_fingerprint": manifest.get("data_fingerprint"),
+        "run_time": run_time or datetime.now(timezone.utc).isoformat(),
         "source_mode": source_mode,
         "scenario_summary": scenario_summary,
         **common,
@@ -158,5 +211,61 @@ def apply_forecast_run_to_session(
     history = list(session_state.get("forecast_history", []))
     history.insert(0, history_entry)
     session_state["forecast_history"] = history[:HISTORY_LIMIT]
-    save_persisted_history(session_state["forecast_history"])
+    session_state["history_save_error"] = save_persisted_history(
+        session_state["forecast_history"]
+    )
     session_state["forecast_results_section"] = "📉 Forecast"
+
+
+def record_auxiliary_run(session_state, workflow, manifest, **details):
+    ensure_history_loaded(session_state)
+    entry = dict(
+        run_id=manifest["run_id"],
+        run_time=manifest["created_at"],
+        schema_version=1,
+        workflow=workflow,
+        data_fingerprint=manifest["data_fingerprint"],
+        **details,
+    )
+    session_state["forecast_history"] = [entry, *session_state["forecast_history"]][
+        :HISTORY_LIMIT
+    ]
+    session_state["history_save_error"] = save_persisted_history(
+        session_state["forecast_history"]
+    )
+
+
+def cached_forecast(session_state, raw, settings, progress_callback=None):
+    """Bounded, session-private reuse keyed by data, settings and engine source."""
+    import copy
+    import hashlib
+    from dataclasses import replace
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    import visit_forecast
+    from visit_forecast import forecast_visits
+
+    engine = hashlib.sha256()
+    for path in sorted(Path(visit_forecast.__file__).parent.glob("*.py")):
+        engine.update(path.name.encode())
+        engine.update(path.read_bytes())
+    signature = configuration_fingerprint(
+        {**settings, "engine": engine.hexdigest()}, raw
+    )
+    cache = session_state.setdefault("forecast_cache", {})
+    if signature in cache:
+        result = copy.deepcopy(cache[signature])
+        manifest = {
+            **result.run_manifest,
+            "cached_from_run": result.run_manifest["run_id"],
+            "run_id": str(uuid4()),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if progress_callback:
+            progress_callback("Reusing matching validated run from this session")
+        return replace(result, run_manifest=manifest)
+    result = forecast_visits(df=raw, **settings, progress_callback=progress_callback)
+    if len(cache) >= 3:
+        del cache[next(iter(cache))]
+    cache[signature] = copy.deepcopy(result)
+    return result

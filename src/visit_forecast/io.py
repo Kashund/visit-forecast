@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -9,7 +11,9 @@ import pandas as pd
 def validate_columns(df: pd.DataFrame, required: List[str]) -> None:
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {missing}. Found columns: {list(df.columns)}")
+        raise ValueError(
+            f"Missing required columns: {missing}. Found columns: {list(df.columns)}"
+        )
 
 
 def to_month_start(dt: pd.Series) -> pd.Series:
@@ -45,17 +49,108 @@ def generate_synthetic_data(
             + noise
             + offset
         )
-        df_list.append(pd.DataFrame({"Date": dates, "Visits": visits, "Department": dept}))
+        df_list.append(
+            pd.DataFrame({"Date": dates, "Visits": visits, "Department": dept})
+        )
 
     return pd.concat(df_list, ignore_index=True)
 
 
-def load_data(use_synthetic: bool, filename: Optional[str], start: str, end: str) -> pd.DataFrame:
+def read_data_file(file) -> pd.DataFrame:
+    """Read a supported path or uploaded file without guessing its format."""
+    name = str(getattr(file, "name", file)).lower()
+    suffix = Path(name).suffix
+    if suffix == ".csv":
+        return pd.read_csv(file)
+    if suffix == ".xlsx":
+        return pd.read_excel(file, engine="openpyxl")
+    raise ValueError(
+        "Unsupported file format. Use .csv or .xlsx; legacy .xls is not supported."
+    )
+
+
+@dataclass
+class DataValidationReport:
+    normalized: pd.DataFrame
+    issues: pd.DataFrame
+    coverage: pd.DataFrame
+    duplicate_rows: int
+
+    @property
+    def valid(self) -> bool:
+        return self.issues.empty
+
+    def raise_if_invalid(self) -> None:
+        if not self.valid:
+            details = "; ".join(
+                f"row {row.row}: {row.issue}"
+                for row in self.issues.head(8).itertuples()
+            )
+            raise ValueError(
+                f"Dataset is not forecast-ready: {details}. Correct invalid values before forecasting."
+            )
+
+
+def inspect_data(df_raw: pd.DataFrame) -> DataValidationReport:
+    """Shared, non-destructive validation. Never silently discard bad records.
+
+    Coverage describes the observed dataset window; missing months are not zeros.
+    Forecasting applies the selected department/window policy separately.
+    """
+    validate_columns(df_raw, ["Date", "Visits", "Department"])
+    df = df_raw.copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", format="mixed")
+    df["Visits"] = pd.to_numeric(df["Visits"], errors="coerce")
+    df["Department"] = df["Department"].astype("string").str.strip()
+    masks = {
+        "invalid Date": df["Date"].isna(),
+        "Visits must be finite and numeric": ~np.isfinite(df["Visits"]),
+        "Visits must be non-negative": df["Visits"].lt(0),
+        "Department must not be blank": df["Department"].isna()
+        | df["Department"].eq(""),
+    }
+    issues = pd.DataFrame(
+        [
+            {"row": int(position) + 2, "issue": message}
+            for message, mask in masks.items()
+            for position in np.flatnonzero(mask.fillna(True).to_numpy())
+        ],
+        columns=["row", "issue"],
+    )
+    valid = pd.Series(True, index=df.index)
+    for mask in masks.values():
+        valid &= ~mask.fillna(True)
+    normalized = df.loc[valid].copy()
+    normalized["Date"] = to_month_start(normalized["Date"])
+    duplicate_rows = int(
+        normalized.duplicated(["Department", "Date"], keep=False).sum()
+    )
+    rows = []
+    if not normalized.empty:
+        months = pd.date_range(normalized.Date.min(), normalized.Date.max(), freq="MS")
+        for dept, group in normalized.groupby("Department"):
+            missing = months.difference(pd.DatetimeIndex(group.Date))
+            rows.append(
+                {
+                    "Department": dept,
+                    "First_Month": group.Date.min(),
+                    "Last_Month": group.Date.max(),
+                    "Observed_Months": group.Date.nunique(),
+                    "Missing_Months_Count": len(missing),
+                    "Missing_Months": ", ".join(missing.strftime("%Y-%m")),
+                }
+            )
+    return DataValidationReport(normalized, issues, pd.DataFrame(rows), duplicate_rows)
+
+
+def load_data(
+    use_synthetic: bool, filename: Optional[str], start: str, end: str
+) -> pd.DataFrame:
     if use_synthetic:
         return generate_synthetic_data(start, end)
     if not filename:
         raise ValueError("filename must be provided if use_synthetic=False")
-    return pd.read_excel(filename)
+    return read_data_file(filename)
 
 
 def prepare_dataframe(
@@ -65,21 +160,9 @@ def prepare_dataframe(
     department: str,
     exclude_departments: Optional[List[str]],
 ) -> Tuple[pd.DataFrame, str]:
-    validate_columns(df_raw, ["Date", "Visits", "Department"])
-
-    df = df_raw.copy()
-    df["Date"] = to_month_start(df["Date"])
-    df["Visits"] = pd.to_numeric(df["Visits"], errors="coerce")
-    df["Department"] = df["Department"].astype("string").str.strip()
-    df = df.dropna(subset=["Date", "Visits", "Department"])
-    df = df[df["Department"].ne("")]
-    df = df[np.isfinite(df["Visits"])]
-    negative_visit_count = int(df["Visits"].lt(0).sum())
-    if negative_visit_count:
-        raise ValueError(
-            "Visits must be non-negative; "
-            f"found {negative_visit_count} negative value(s)."
-        )
+    report = inspect_data(df_raw)
+    report.raise_if_invalid()
+    df = report.normalized.copy()
 
     start_dt = pd.to_datetime(timeframe_start).to_period("M").to_timestamp()
     end_dt = pd.to_datetime(timeframe_end).to_period("M").to_timestamp()
@@ -89,13 +172,25 @@ def prepare_dataframe(
 
     if exclude_departments:
         normalized_exclusions = {
-            str(department_name).strip()
-            for department_name in exclude_departments
+            str(department_name).strip() for department_name in exclude_departments
         }
         df = df[~df["Department"].isin(normalized_exclusions)]
 
     if df.empty:
         raise ValueError("No data remains after timeframe/exclusion filtering.")
+
+    # Validate each contribution before summing All: another department must
+    # not conceal a missing submission as a genuine decline in demand.
+    if str(department).strip() == "All":
+        coverage = inspect_data(df).coverage
+        incomplete = coverage[coverage["Missing_Months_Count"].gt(0)]
+        if not incomplete.empty:
+            detail = "; ".join(
+                f"{r.Department}: {r.Missing_Months}" for r in incomplete.itertuples()
+            )
+            raise ValueError(
+                f"Monthly history contains missing department observations: {detail}. Select a common complete window or correct the gaps."
+            )
 
     normalized_department = str(department).strip()
     if normalized_department != "All":
@@ -118,14 +213,11 @@ def prepare_dataframe(
     df_f = df_f.rename(columns={"Date": "ds", "Visits": "y"})
     df_f = df_f.sort_values("ds").reset_index(drop=True)
 
-    expected_months = pd.date_range(
-        df_f["ds"].min(), df_f["ds"].max(), freq="MS"
-    )
+    expected_months = pd.date_range(df_f["ds"].min(), df_f["ds"].max(), freq="MS")
     missing_months = expected_months.difference(pd.DatetimeIndex(df_f["ds"]))
     if not missing_months.empty:
         missing_preview = ", ".join(
-            timestamp.strftime("%Y-%m")
-            for timestamp in missing_months[:6]
+            timestamp.strftime("%Y-%m") for timestamp in missing_months[:6]
         )
         suffix = "…" if len(missing_months) > 6 else ""
         raise ValueError(

@@ -7,13 +7,13 @@ This repo provides:
 
 ## Forecast models
 The app supports five models plus an automatic mode:
-- **Auto (compare models)**: backtests every eligible model with the same rolling protocol and selects the best balanced MAPE and RMSE. Diagnostics show all candidates, including a seasonal naive baseline so you can confirm the winner actually beats a naive repeat of last year.
+- **Auto (compare models)**: backtests every eligible model with the same rolling protocol and selects the best balanced MAPE and RMSE (MAE and RMSE when MAPE is unavailable, such as all-zero demand). Eligible candidates are scored on an explicitly shared validation start and stride; ineligible candidates retain their failure reasons. Diagnostics show all candidates, including a seasonal naive baseline so you can confirm the winner actually beats a naive repeat of last year.
 - **Prophet**: the original model. The only model with Prophet-native intervals, CV, and component plots.
 - **Holt-Winters (ETS)** and **Theta**: fast classical models that are strong performers on monthly seasonal data.
-- **SARIMA**: seasonal ARIMA (1,1,1)x(1,1,1,12) when at least two full seasons of history exist.
+- **SARIMA**: seasonal ARIMA (1,1,1)x(1,1,1,12) when at least 30 monthly observations exist (the Darts ARIMA wrapper requires 30 observations).
 - **Seasonal naive**: repeats the last 12 months; useful as an honesty check.
 
-Non-Prophet models always use conformal calibrated intervals (Prophet-native intervals do not exist for them). Models needing two seasonal cycles automatically fall back to non-seasonal variants on short histories.
+Non-Prophet models select conformal calibrated intervals; if explicit bounds cannot be generated, a stored and labeled normal RMSE approximation is used when validation errors are available. They never select Prophet uncertainty. Prophet-native intervals do not exist for these models. ETS and Theta fall back to non-seasonal variants on short histories. The installed Darts ARIMA wrapper requires 30 observations even for non-seasonal ARIMA; shorter histories receive an actionable eligibility error or are excluded from Auto comparison.
 
 CLI: `--model auto|prophet|ets|theta|arima|seasonal_naive`
 Python: `forecast_visits(..., model_choice="auto")`
@@ -40,14 +40,14 @@ often have different trend and seasonality profiles. An "Include Prophet in
 auto comparison" toggle (off by default) keeps multi-department runs fast; the
 classical models are usually competitive on monthly data. Results include a
 per-department model and accuracy summary, a combined chart, and Excel/CSV
-export. The total is labeled `All (sum of departments)` only when every
-requested department succeeds. Otherwise it is labeled
-`Partial total (x/y departments)` and exports include completeness metadata.
+export. All department forecasts must share a forecast origin and future date grid. A department whose history ends early is reported as a failure, not silently treated as zero. The total is labeled `All (sum of departments)` only when every
+requested department succeeds and contributes to every forecast date. Otherwise it is labeled
+`Partial total (x/y departments)` and exports include per-date completeness metadata, failure reasons, candidate diagnostics, and run manifests. Expand a department to inspect its forecast, fiscal summary, evaluation, and model comparison.
 Programmatic access: `forecast_departments(...)` returns per-department results,
 a summary table, and the combined frame.
 
 ## Scenario comparison (page 4)
-The Scenario Comparison page fits the forecast once, then applies two capacity phase configurations (Scenario A and Scenario B) to the same fitted baseline, so differences between scenarios are purely the phase assumptions rather than refit noise. It shows a three-line chart (baseline, A, B), a monthly detail table with A minus Baseline, B minus Baseline, and A minus B deltas, fiscal year totals, and Excel export with Monthly_Comparison, FY_Summary, and Scenario_Definitions sheets. Programmatic access: `apply_capacity_phases_to_future_df(future_df, phases)` recomputes adjustments from `yhat_original`, so it never compounds on prior adjustments.
+The Scenario Comparison page fits the forecast once, then applies two capacity phase configurations (Scenario A and Scenario B) to the same fitted baseline, so differences between scenarios are purely the phase assumptions rather than refit noise. Phase-only reruns reuse the fitted baseline; changing data or baseline settings invalidates that reuse. Both scenarios support four phases, 100% loss, and additions above 100%. It shows a three-line chart (baseline, A, B), a monthly detail table with A minus Baseline, B minus Baseline, and A minus B deltas, fiscal year totals, and Excel export with Monthly_Comparison, FY_Summary, and Scenario_Definitions sheets. Programmatic access: `apply_capacity_phases_to_future_df(future_df, phases)` recomputes adjustments from `yhat_original`, so it never compounds on prior adjustments.
 
 ## Dependencies
 Supported dependency ranges are constrained in `pyproject.toml`. Darts uses the
@@ -68,8 +68,8 @@ Input must contain columns:
 
 Use `.xlsx` or `.csv` files. Dates are normalized to month start, duplicate
 rows for the same department/month are summed, Visits must be finite and
-non-negative, and each forecasted series must contain every month between its
-first and last observation.
+non-negative. Invalid dates, visits, and blank departments produce explicit validation errors; they are never silently dropped. Each forecasted series must contain every month between its
+first and last observation. Aggregating All also requires complete department/month contributions across the selected observed window, so another department cannot hide a missing submission. Select a common complete window or explicitly exclude inactive departments; missing observations are never automatically zero-filled.
 
 ## Install
 From repo root:
@@ -85,7 +85,7 @@ uv sync --locked --extra dev --no-editable
 
 The non-editable install is intentional for Python 3.13 compatibility and
 matches CI. It verifies the built package instead of relying on an
-editable-install `.pth` file.
+editable-install `.pth` file. After changing package source, refresh the installed copy with `uv sync --locked --extra dev --no-editable --reinstall-package visit-forecast`; a plain sync may reuse the previous non-editable build.
 
 ## Run the Streamlit app
 ```bash
@@ -132,6 +132,49 @@ result = forecast_visits(
 print(result.fiscal_summary)
 ```
 
+## Fiscal Summary views
+
+The Fiscal Summary section has a single **Fiscal Month / Fiscal Quarter / Fiscal Year** selector that updates both its table and chart. Every view keeps **Historical Visits**, **Original Forecast**, and **Adjusted Forecast** separate, including periods containing a mixture of actuals and forecasts. Changing views reuses the existing run.
+
+The calendar is Apr–Mar: April is fiscal month 1 and March month 12. For example, April 2024 is `FY2025 M01 (Apr 2024)`, and January 2025 is `FY2025 M10 (Jan 2025)`. Quarter/year values sum the same monthly values at full precision. Quarter subtotal rows are excluded from chart totals.
+
+`Historical_Months`, `Forecast_Months`, `Covered_Months`, `Period_Months`, and `Coverage_Status` identify partial periods. A missing value is unavailable, not a genuine zero. The CSV download matches the selected view. Validation error metrics remain month-based regardless of fiscal view.
+
+Python: `aggregate_summary_by_period(history, future, period="month" | "quarter" | "year")`, imported from `visit_forecast`.
+
+## Public APIs and workflow exports
+
+```python
+from visit_forecast import (
+    forecast_visits, forecast_departments,
+    apply_capacity_phases_to_future_df, inspect_data,
+)
+```
+
+All forecast pages accept CSV/XLSX, pasted CSV, or synthetic input. Department and Scenario pages can also reuse a dataset from another run or Data Check in the same browser session. A warning identifies controls changed since the displayed result. Results are updated only when the corresponding Run button is pressed.
+
+CLI workflows keep the original forecast command and add these options:
+
+```bash
+uv run --no-editable python scripts/run_forecast_cli.py \
+  --filename data/sample/synthetic_visits.csv --model seasonal_naive \
+  --months 3 --uncertainty conformal --fiscal-view month --output-dir /tmp/visit-output
+
+uv run --no-editable python scripts/run_forecast_cli.py \
+  --use_synthetic --workflow departments --model auto \
+  --candidates ets theta seasonal_naive --exclude Neurology --output-dir /tmp/departments
+
+uv run --no-editable python scripts/run_forecast_cli.py \
+  --use_synthetic --workflow scenarios --model seasonal_naive --months 3 \
+  --scenario-a-json '[{"mode":"add","percent":125,"start_month":1,"end_month":3}]' \
+  --scenario-b-json '[{"mode":"loss","percent":100,"start_month":2,"end_month":3}]' \
+  --output-dir /tmp/scenarios
+```
+
+Use `--calendar-covariates`, repeated `--exclude`, `--tuning manual|auto`, and `--uncertainty prophet|conformal|auto` as appropriate. Calendar covariates count Monday–Friday, without regional holidays or clinic closures. Empty or unknown Auto candidate lists are rejected, and a failed comparison never reintroduces an excluded model.
+
+Output directories contain full-precision CSV tables, `forecast.xlsx`, and `run_manifest.json`. Manifests identify the input fingerprint, code/dependency versions, requested/effective settings, evaluation period, warnings, and run ID. They do not contain the raw input dataset. Run Forecast also offers a manifest download, and department/scenario workbooks include a manifest sheet. Repeated identical main forecasts can reuse up to three results within the current session, keyed by data, settings, and engine source. A new run ID still records each deliberate run. Progress identifies validation, selection, fitting, and evaluation stages. Session history records all three workflows; opt-in local persistence uses atomic writes and reports save failures. On shared machines, use separate accounts/history directories; localhost alone does not isolate users.
+
 ## Notes
 - Dates are normalized to month-start.
 - Fiscal year is Apr → Mar (Apr–Dec -> FY+1, Jan–Mar -> FY same year).
@@ -158,6 +201,8 @@ python scripts/build_sample_data.py
 ## Notebook quickstart
 Open:
 - `notebooks/00_Quickstart.ipynb`
+
+Notebook tooling is optional: `uv run --no-editable --with jupyterlab --with ipykernel jupyter lab notebooks`. Select the project Python environment as the kernel. Dependencies for the application remain pinned in `uv.lock`; optional notebook tooling is not part of that lock.
 
 
 ### Pandas note
@@ -226,6 +271,10 @@ The future forecast table includes:
 - `applied_phase_ids` (comma-separated phase order)
 
 ## Forecast validation (backtesting)
+
+When history contains at least `max(48, 2 * forecast_months + 26)` observations, the final forecast horizon is reserved before model/parameter selection. Reported point metrics then score that final block; final live forecasts are fitted on all history. Reserved-block interval coverage is reported separately from development interval diagnostics, using calibration outcomes preceding that block. One reserved origin is limited evidence, not a coverage guarantee.
+
+Shorter histories retain development backtests, explicitly labeled as lacking independent final evaluation. The UI reports unavailable MAPE rather than assigning a quality rating when all actuals are zero. Selection scores and final evaluation can differ. Negative model point predictions are clipped at zero visits; manifests disclose this policy.
 Backtesting scores every month of each rolling forecast fold (not just the final month), so MAPE, MAE, and RMSE reflect the average error per forecasted month as described below.
 
 The app reports:
@@ -239,16 +288,15 @@ For MAE/RMSE, the status is based on error relative to the mean actual volume.
 ## Confidence & error bands
 The forecast chart shows a confidence band. Prophet-native intervals support
 calendar covariates. Conformal intervals are calibrated on older rolling
-forecast cutoffs and evaluated on held-out newer cutoffs; if there is too
+forecast cutoffs and evaluated on newer cutoffs; calibration outcomes unavailable at the first evaluation origin are purged, including overlapping target dates; if there is too
 little history for held-out evaluation, coverage is reported as unavailable
 rather than resubstitution coverage. If the selected method cannot produce
-explicit bounds, the app falls back to an RMSE approximation and records the
-source used. It also overlays MAE and RMSE error bands around the adjusted
+explicit bounds, the app stores a normal RMSE approximation at the requested nominal level and records `rmse_approx` as the source. These approximate bounds are exported as well as plotted. Empirical quantile intervals assume stable errors and do not guarantee nominal coverage for dependent monthly data. It also overlays MAE and RMSE error bands around the adjusted
 forecast.
 
 ## Run history
-The Streamlit app keeps a log of the last 20 runs in the current browser
-session, including inputs and validation metrics. Local disk persistence is
+The Streamlit app keeps a log of the last 20 forecast, department, and scenario runs in the current browser
+session, including settings and validation metadata. Local disk persistence is
 opt-in as described above. You can clear history from the sidebar.
 
 ## Deployment checklist

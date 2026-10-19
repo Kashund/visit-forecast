@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import NormalDist
+from time import perf_counter
 from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import pandas as pd
 
 from .fiscal import add_fiscal_year, fiscal_summary
-from .io import load_data, prepare_dataframe, validate_columns
+from .io import inspect_data, load_data, prepare_dataframe, validate_columns
 from .model_prophet import (
     backtest,
     build_conformal_intervals,
@@ -21,6 +23,7 @@ from .models import (
     COVARIATE_CAPABLE_MODELS,
     MODEL_LABELS,
     SELECTABLE_MODELS,
+    model_variant,
     build_calendar_covariate_series,
     fit_and_forecast_model,
     select_forecast_model,
@@ -31,6 +34,7 @@ from .tuning import (
     select_uncertainty_configuration,
 )
 from .types import ForecastResult
+from .provenance import build_run_manifest
 
 
 @dataclass
@@ -63,6 +67,9 @@ def _normalize_capacity_phases(
         if isinstance(phase, CapacityPhase):
             normalized_phase = phase
         elif isinstance(phase, dict):
+            if phase.get("enabled", True) is False:
+                normalized_phases.append(CapacityPhase(False, "loss", 0.0, 1, 1))
+                continue
             normalized_phase = CapacityPhase(
                 enabled=bool(phase.get("enabled", True)),
                 mode=str(phase.get("mode", "loss")),
@@ -184,7 +191,9 @@ def build_future_forecast_df(
 
     fc_df = fc_df.rename(columns={value_col: "yhat"})
     fc_df["yhat"] = pd.to_numeric(fc_df["yhat"], errors="coerce").astype(float)
-    fc_df["yhat_original"] = fc_df["yhat"].astype(float)
+    if not np.isfinite(fc_df["yhat"]).all():
+        raise ValueError("Forecast contains non-finite values.")
+    fc_df["yhat_original"] = fc_df["yhat"].clip(lower=0).astype(float)
 
     # Keep only future rows
     fut = fc_df[fc_df["ds"] > last_hist_date].copy()
@@ -220,6 +229,7 @@ def _apply_normalized_phases(
     fut: pd.DataFrame, normalized_phases: List[CapacityPhase]
 ) -> pd.DataFrame:
     """Apply normalized phases to a frame with yhat_original and forecast_month."""
+    fut["adjustment_factor"] = 1.0
     for phase_index, phase in enumerate(normalized_phases, start=1):
         # Zero-percent phases are no-ops; do not flag months as adjusted.
         if not phase.enabled or float(phase.percent) == 0.0:
@@ -235,7 +245,10 @@ def _apply_normalized_phases(
 
         percentage = float(phase.percent) / 100.0
         factor = 1.0 - percentage if phase.mode.lower() == "loss" else 1.0 + percentage
-        fut.loc[in_range, "yhat_adjusted"] = fut.loc[in_range, "yhat_adjusted"] * factor
+        fut.loc[in_range, "adjustment_factor"] *= factor
+        fut.loc[in_range, "yhat_adjusted"] = (
+            fut.loc[in_range, "yhat_original"] * fut.loc[in_range, "adjustment_factor"]
+        )
         fut.loc[in_range, "adj_applied_any"] = True
         fut.loc[in_range, "applied_phase_ids"] = fut.loc[
             in_range, "applied_phase_ids"
@@ -249,6 +262,14 @@ def _apply_normalized_phases(
         fut.loc[in_range, "adj_applied"] = True
 
     fut["adj_applied"] = fut["adj_applied_any"]
+    if not np.isfinite(
+        fut[["yhat_original", "yhat_adjusted", "adjustment_factor"]].to_numpy(
+            dtype=float
+        )
+    ).all():
+        raise ValueError(
+            "Capacity adjustment produced non-finite values; reduce the percentage."
+        )
     return fut
 
 
@@ -282,7 +303,28 @@ def apply_capacity_phases_to_future_df(
         capacity_phases,
         forecast_periods=int(scenario_df["forecast_month"].max()),
     )
-    return _apply_normalized_phases(scenario_df, normalized_phases)
+    scenario_df = _apply_normalized_phases(scenario_df, normalized_phases)
+    # Retain immutable baseline bounds: reapplying a scenario never compounds.
+    for column in [
+        c
+        for c in scenario_df
+        if c.startswith(("yhat_lower", "yhat_upper")) and not c.endswith("_baseline")
+    ]:
+        baseline_column = f"{column}_baseline"
+        if baseline_column not in scenario_df:
+            old_factor = pd.to_numeric(
+                future_df.get(
+                    "adjustment_factor", pd.Series(1.0, index=future_df.index)
+                ),
+                errors="coerce",
+            ).replace(0, np.nan)
+            scenario_df[baseline_column] = (
+                pd.to_numeric(future_df[column], errors="coerce") / old_factor
+            )
+        scenario_df[column] = (
+            scenario_df[baseline_column] * scenario_df["adjustment_factor"]
+        )
+    return scenario_df
 
 
 def _initialize_interval_columns(future_df: pd.DataFrame) -> pd.DataFrame:
@@ -320,10 +362,14 @@ def _scale_interval_columns_for_adjustments(future_df: pd.DataFrame) -> pd.DataF
     if adjustment_flag_column is None:
         return scaled
 
-    factor = (
-        pd.to_numeric(scaled["yhat_adjusted"], errors="coerce")
-        / pd.to_numeric(scaled["yhat_original"], errors="coerce").replace(0, np.nan)
-    ).replace([np.inf, -np.inf], np.nan).fillna(1.0)
+    factor = scaled.get("adjustment_factor")
+    if factor is None:
+        # Compatibility for externally supplied legacy frames. Current builders
+        # always retain explicit factors, including zero-baseline/total-loss cases.
+        factor = (
+            pd.to_numeric(scaled.yhat_adjusted, errors="coerce")
+            / pd.to_numeric(scaled.yhat_original, errors="coerce").replace(0, np.nan)
+        ).fillna(1.0)
     mask = scaled[adjustment_flag_column].fillna(False)
     if not mask.any():
         return scaled
@@ -335,6 +381,7 @@ def _scale_interval_columns_for_adjustments(future_df: pd.DataFrame) -> pd.DataF
         "yhat_upper_conformal",
     ]:
         if column_name in scaled.columns:
+            scaled[f"{column_name}_baseline"] = scaled[column_name]
             scaled.loc[mask, column_name] = (
                 pd.to_numeric(scaled.loc[mask, column_name], errors="coerce")
                 * factor.loc[mask]
@@ -358,9 +405,17 @@ def _activate_interval_source(
         upper_col = f"yhat_upper_{source_name}"
         if lower_col not in activated.columns or upper_col not in activated.columns:
             continue
-        if activated[[lower_col, upper_col]].notna().any().any():
-            activated["yhat_lower"] = activated[lower_col]
-            activated["yhat_upper"] = activated[upper_col]
+        if np.isfinite(activated[[lower_col, upper_col]].to_numpy(dtype=float)).all():
+            activated["yhat_lower"] = activated[lower_col].clip(lower=0)
+            activated["yhat_upper"] = np.maximum(
+                activated[upper_col], activated["yhat_lower"]
+            )
+            activated["yhat_lower_baseline"] = activated.get(
+                f"{lower_col}_baseline", activated[lower_col]
+            )
+            activated["yhat_upper_baseline"] = activated.get(
+                f"{upper_col}_baseline", activated[upper_col]
+            )
             activated["interval_source"] = source_name
             return activated, source_name
 
@@ -386,7 +441,11 @@ def _build_prophet_interval_validation(
     cv_metrics_df: pd.DataFrame | None,
     target_coverage: float,
 ) -> tuple[pd.DataFrame | None, Dict[str, Any]]:
-    if cv_metrics_df is None or cv_metrics_df.empty or "coverage" not in cv_metrics_df.columns:
+    if (
+        cv_metrics_df is None
+        or cv_metrics_df.empty
+        or "coverage" not in cv_metrics_df.columns
+    ):
         return None, {
             "empirical_coverage_overall": float("nan"),
             "empirical_coverage_by_horizon": {},
@@ -478,11 +537,7 @@ def _build_uncertainty_method_selection(
                 "note": (
                     "Coverage unavailable"
                     if pd.isna(empirical_coverage)
-                    else (
-                        "Fallback calibration used"
-                        if fallback_used
-                        else ""
-                    )
+                    else ("Fallback calibration used" if fallback_used else "")
                 ),
                 "candidate_order": candidate_order[method_name],
             }
@@ -549,21 +604,37 @@ def forecast_visits(
     model_choice: str = "prophet",
     use_calendar_covariates: bool = False,
     auto_candidates: Optional[List[str]] = None,
+    progress_callback=None,
 ) -> ForecastResult:
-    if forecast_periods <= 0:
-        raise ValueError("forecast_periods must be > 0")
+    def report_progress(message):
+        if progress_callback is not None:
+            progress_callback(message)
+
+    report_progress("Validating input")
+    run_started = perf_counter()
+    if (
+        not isinstance(forecast_periods, (int, np.integer))
+        or isinstance(forecast_periods, bool)
+        or forecast_periods <= 0
+    ):
+        raise ValueError("forecast_periods must be a positive integer")
     if uncertainty_method not in {"prophet", "conformal", "auto"}:
         raise ValueError(
             "uncertainty_method must be either 'prophet', 'conformal', or 'auto'"
         )
     if model_choice not in set(SELECTABLE_MODELS) | {"auto"}:
-        raise ValueError(
-            f"model_choice must be one of {SELECTABLE_MODELS + ['auto']}"
-        )
+        raise ValueError(f"model_choice must be one of {SELECTABLE_MODELS + ['auto']}")
 
     requested_target_coverage = float(
         target_coverage if target_coverage is not None else interval_width
     )
+
+    if (
+        not np.isfinite(requested_target_coverage)
+        or not 0 < requested_target_coverage < 1
+    ):
+        raise ValueError("target_coverage must be strictly between 0 and 1.")
+    requested_uncertainty_method = uncertainty_method
 
     if capacity_phases is None:
         legacy_phase = CapacityPhase(
@@ -603,6 +674,26 @@ def forecast_visits(
 
     df_prepared = add_fiscal_year(df_prepared, "ds")
 
+    # The last horizon is never offered to automatic model/parameter selection.
+    # Short histories keep descriptive backtests, explicitly labeled as such.
+    reserve_block = len(df_prepared) >= max(48, 2 * forecast_periods + 26)
+    selection_df = (
+        df_prepared.iloc[:-forecast_periods].copy() if reserve_block else df_prepared
+    )
+    evaluation_summary = {
+        "mode": "development_backtest",
+        "coverage_note": "No independent final block: insufficient history. Selection and development diagnostics can reuse observations.",
+    }
+
+    calendar_covariates = None
+    if use_calendar_covariates:
+        try:
+            calendar_covariates = build_calendar_covariate_series(
+                df_prepared, forecast_periods
+            )
+        except Exception as exc:
+            raise ValueError(f"Calendar covariate generation failed: {exc}") from exc
+
     selected_changepoint_prior_scale = float(changepoint_prior_scale)
     selected_interval_width = float(requested_target_coverage)
     effective_target_coverage = float(requested_target_coverage)
@@ -622,7 +713,11 @@ def forecast_visits(
         and not joint_auto_tuning_enabled
     )
 
-    prophet_tuning_applicable = model_choice in {"prophet", "auto"}
+    report_progress("Selecting configuration")
+    prophet_tuning_applicable = model_choice == "prophet" or (
+        model_choice == "auto"
+        and (auto_candidates is None or "prophet" in auto_candidates)
+    )
 
     if tuning_mode == "auto" and not prophet_tuning_applicable:
         tuning_note = (
@@ -632,36 +727,53 @@ def forecast_visits(
     elif tuning_mode == "auto":
         if used_joint_auto_tuning:
             tuning_selection = select_joint_forecast_configuration(
-                df_prepared=df_prepared,
+                df_prepared=selection_df,
                 forecast_periods=forecast_periods,
                 target_coverage=requested_target_coverage,
+                interval_width_candidates=[requested_target_coverage],
+                **(
+                    {"future_covariates": calendar_covariates}
+                    if calendar_covariates is not None
+                    else {}
+                ),
             )
-            selected_changepoint_prior_scale = (
-                tuning_selection.changepoint_prior_scale
-            )
-            selected_interval_width = tuning_selection.interval_width
+            selected_changepoint_prior_scale = tuning_selection.changepoint_prior_scale
+            selected_interval_width = requested_target_coverage
             tuning_primary_metric = tuning_selection.primary_metric
             tuning_primary_score = tuning_selection.primary_score
             tuning_note = tuning_selection.note
             tuning_diagnostics_df = tuning_selection.diagnostics_df
-            selected_uncertainty_method_from_tuning = tuning_selection.uncertainty_method
+            selected_uncertainty_method_from_tuning = (
+                tuning_selection.uncertainty_method
+            )
         elif used_separate_auto_passes:
             changepoint_tuning_selection = select_prophet_hyperparameters(
-                df_prepared=df_prepared,
+                df_prepared=selection_df,
                 forecast_periods=forecast_periods,
                 tune_interval_width=False,
                 fixed_interval_width=requested_target_coverage,
+                **(
+                    {"future_covariates": calendar_covariates}
+                    if calendar_covariates is not None
+                    else {}
+                ),
             )
             selected_changepoint_prior_scale = (
                 changepoint_tuning_selection.changepoint_prior_scale
             )
             uncertainty_tuning_selection = select_uncertainty_configuration(
-                df_prepared=df_prepared,
+                df_prepared=selection_df,
                 forecast_periods=forecast_periods,
                 changepoint_prior_scale=selected_changepoint_prior_scale,
+                target_coverage_candidates=[requested_target_coverage],
+                **(
+                    {"future_covariates": calendar_covariates}
+                    if calendar_covariates is not None
+                    else {}
+                ),
             )
-            selected_interval_width = uncertainty_tuning_selection.interval_width
-            effective_target_coverage = uncertainty_tuning_selection.interval_width
+            selected_interval_width = requested_target_coverage
+            effective_target_coverage = requested_target_coverage
             selected_uncertainty_method_from_tuning = (
                 uncertainty_tuning_selection.uncertainty_method
             )
@@ -688,15 +800,18 @@ def forecast_visits(
             )
         else:
             tuning_selection = select_prophet_hyperparameters(
-                df_prepared=df_prepared,
+                df_prepared=selection_df,
                 forecast_periods=forecast_periods,
                 tune_interval_width=False,
                 fixed_interval_width=requested_target_coverage,
+                **(
+                    {"future_covariates": calendar_covariates}
+                    if calendar_covariates is not None
+                    else {}
+                ),
             )
-            selected_changepoint_prior_scale = (
-                tuning_selection.changepoint_prior_scale
-            )
-            selected_interval_width = tuning_selection.interval_width
+            selected_changepoint_prior_scale = tuning_selection.changepoint_prior_scale
+            selected_interval_width = requested_target_coverage
             tuning_primary_metric = tuning_selection.primary_metric
             tuning_primary_score = tuning_selection.primary_score
             tuning_note = tuning_selection.note
@@ -704,24 +819,20 @@ def forecast_visits(
     elif tuning_mode != "manual":
         raise ValueError("tuning_mode must be either 'manual' or 'auto'")
 
-    calendar_covariates = None
-    if use_calendar_covariates:
-        try:
-            calendar_covariates = build_calendar_covariate_series(
-                df_prepared, forecast_periods
-            )
-        except Exception:
-            calendar_covariates = None
-
     selected_model_name = model_choice
     if model_choice == "auto":
         model_selection = select_forecast_model(
-            df_prepared=df_prepared,
+            df_prepared=selection_df,
             forecast_periods=forecast_periods,
             changepoint_prior_scale=selected_changepoint_prior_scale,
             interval_width=selected_interval_width,
             future_covariates=calendar_covariates,
             candidates=auto_candidates,
+            **(
+                {"progress_callback": progress_callback}
+                if progress_callback is not None
+                else {}
+            ),
         )
         selected_model_name = model_selection.model_name
         if model_selection.note:
@@ -745,9 +856,20 @@ def forecast_visits(
                     ignore_index=True,
                 )
 
+    tuning_note = " ".join(
+        filter(
+            None,
+            [
+                tuning_note,
+                f"Effective model: {model_variant(selected_model_name, len(df_prepared))}. Point forecasts are clipped at zero visits.",
+            ],
+        )
+    )
+
     # Prophet-native intervals only exist for Prophet. Every other model
     # uses conformal intervals, which are model agnostic.
-    if selected_model_name != "prophet" and uncertainty_method == "prophet":
+    if selected_model_name != "prophet":
+        used_joint_auto_tuning = False
         uncertainty_method = "conformal"
         conformal_switch_note = (
             f"Prophet-native intervals are unavailable for "
@@ -760,6 +882,7 @@ def forecast_visits(
             else conformal_switch_note
         )
 
+    report_progress("Fitting selected model")
     covariates_used = (
         calendar_covariates is not None
         and selected_model_name in COVARIATE_CAPABLE_MODELS
@@ -791,11 +914,21 @@ def forecast_visits(
             )
         )
         tuning_note = (
-            f"{tuning_note} {covariate_note}".strip()
-            if tuning_note
-            else covariate_note
+            f"{tuning_note} {covariate_note}".strip() if tuning_note else covariate_note
         )
 
+    diagnostic_model, diagnostic_series = model, series
+    if reserve_block:
+        diagnostic_series, _, diagnostic_model = fit_and_forecast_model(
+            selection_df,
+            forecast_periods,
+            selected_model_name,
+            changepoint_prior_scale=selected_changepoint_prior_scale,
+            interval_width=selected_interval_width,
+            future_covariates=calendar_covariates if covariates_used else None,
+        )
+
+    report_progress("Computing validation and uncertainty")
     metrics = backtest(
         model=model,
         series=series,
@@ -850,8 +983,7 @@ def forecast_visits(
                         future_df = future_df.drop(columns=[incoming_column])
         except Exception as exc:
             interval_failure_note = (
-                "Prophet interval generation failed: "
-                f"{type(exc).__name__}: {exc}."
+                f"Prophet interval generation failed: {type(exc).__name__}: {exc}."
             )
             tuning_note = (
                 f"{tuning_note} {interval_failure_note}".strip()
@@ -869,8 +1001,8 @@ def forecast_visits(
     if uncertainty_method in {"conformal", "auto"}:
         try:
             conformal_residuals_df = collect_conformal_residuals(
-                model=model,
-                series=series,
+                model=diagnostic_model,
+                series=diagnostic_series,
                 forecast_horizon=forecast_periods,
                 start=0.7,
                 stride=1,
@@ -885,7 +1017,16 @@ def forecast_visits(
             )
             conformal_interval_diagnostics_df = interval_diagnostics_df
             conformal_interval_summary_metrics = interval_summary_metrics
-        except Exception:
+        except Exception as exc:
+            tuning_note = " ".join(
+                filter(
+                    None,
+                    [
+                        tuning_note,
+                        f"Conformal interval generation failed: {type(exc).__name__}: {exc}",
+                    ],
+                )
+            )
             future_df["yhat_lower_conformal"] = np.nan
             future_df["yhat_upper_conformal"] = np.nan
             conformal_interval_diagnostics_df = None
@@ -921,10 +1062,10 @@ def forecast_visits(
     cv_raw, cv_metrics = (None, None)
     if selected_model_name == "prophet":
         cv_raw, cv_metrics = prophet_cross_validation_metrics(
-            model,
-            initial="730 days",
-            period="180 days",
-            horizon="365 days",
+            diagnostic_model,
+            initial=f"{max(730, forecast_periods * 62)} days",
+            period=f"{max(30, forecast_periods * 15)} days",
+            horizon=f"{forecast_periods * 31} days",
         )
 
     (
@@ -965,6 +1106,30 @@ def forecast_visits(
         uncertainty_method=selected_uncertainty_method,
     )
 
+    if interval_source_used == "none" and np.isfinite(metrics.get("RMSE", np.nan)):
+        z = NormalDist().inv_cdf((1 + effective_target_coverage) / 2)
+        margin = z * float(metrics["RMSE"])
+        factor = future_df.get(
+            "adjustment_factor", pd.Series(1.0, index=future_df.index)
+        )
+        future_df["yhat_lower_baseline"] = (future_df.yhat_original - margin).clip(
+            lower=0
+        )
+        future_df["yhat_upper_baseline"] = future_df.yhat_original + margin
+        future_df["yhat_lower"] = future_df.yhat_lower_baseline * factor
+        future_df["yhat_upper"] = future_df.yhat_upper_baseline * factor
+        future_df["interval_source"] = "rmse_approx"
+        interval_source_used = "rmse_approx"
+        tuning_note = " ".join(
+            filter(
+                None,
+                [
+                    tuning_note,
+                    "Explicit intervals unavailable; stored a normal RMSE approximation, without calibrated coverage guarantees.",
+                ],
+            )
+        )
+
     if selected_uncertainty_method == "prophet":
         interval_diagnostics_df = prophet_interval_diagnostics_df
         interval_summary_metrics = prophet_interval_summary_metrics
@@ -972,7 +1137,10 @@ def forecast_visits(
         interval_diagnostics_df = conformal_interval_diagnostics_df
         interval_summary_metrics = conformal_interval_summary_metrics
 
-    if uncertainty_method_diagnostics_df is not None and not uncertainty_method_diagnostics_df.empty:
+    if (
+        uncertainty_method_diagnostics_df is not None
+        and not uncertainty_method_diagnostics_df.empty
+    ):
         if tuning_diagnostics_df is None or tuning_diagnostics_df.empty:
             tuning_diagnostics_df = uncertainty_method_diagnostics_df.copy()
         else:
@@ -1000,10 +1168,31 @@ def forecast_visits(
     interval_summary_metrics = {
         **interval_summary_metrics,
         "interval_source_used": interval_source_used,
-        "requested_uncertainty_method": uncertainty_method,
+        "requested_uncertainty_method": requested_uncertainty_method,
         "target_coverage": float(effective_target_coverage),
         "uncertainty_method": selected_uncertainty_method,
     }
+
+    if reserve_block:
+        report_progress("Evaluating reserved final block")
+        from .evaluation import evaluate_reserved_block
+
+        metrics, evaluation_summary = evaluate_reserved_block(
+            selection_df,
+            df_prepared.iloc[-forecast_periods:],
+            selected_model_name,
+            forecast_periods,
+            selected_changepoint_prior_scale,
+            effective_target_coverage,
+            selected_uncertainty_method,
+            calendar_covariates if covariates_used else None,
+        )
+    evaluation_summary["duration_seconds"] = round(perf_counter() - run_started, 3)
+    evaluation_summary["selection_end"] = str(selection_df.ds.max().date())
+    evaluation_summary["forecast_origin"] = str(df_prepared.ds.max().date())
+    interval_summary_metrics["validation_scope"] = (
+        "Development diagnostics; see evaluation_summary for reserved-block coverage."
+    )
 
     fy = fiscal_summary(df_prepared, future_df)
     return ForecastResult(
@@ -1019,7 +1208,7 @@ def forecast_visits(
         tuning_mode=tuning_mode,
         selected_changepoint_prior_scale=selected_changepoint_prior_scale,
         selected_interval_width=selected_interval_width,
-        requested_uncertainty_method=uncertainty_method,
+        requested_uncertainty_method=requested_uncertainty_method,
         uncertainty_method=selected_uncertainty_method,
         joint_auto_tuning_enabled=used_joint_auto_tuning,
         target_coverage=float(effective_target_coverage),
@@ -1032,6 +1221,31 @@ def forecast_visits(
         requested_model=model_choice,
         selected_model=selected_model_name,
         used_calendar_covariates=covariates_used,
+        evaluation_summary=evaluation_summary,
+        run_manifest=build_run_manifest(
+            df_prepared,
+            dict(
+                timeframe_start=timeframe_start,
+                timeframe_end=timeframe_end,
+                forecast_periods=forecast_periods,
+                department=department,
+                exclude_departments=exclude_departments,
+                requested_model=model_choice,
+                selected_model=selected_model_name,
+                effective_variant=model_variant(selected_model_name, len(df_prepared)),
+                tuning_mode=tuning_mode,
+                changepoint_prior_scale=selected_changepoint_prior_scale,
+                requested_coverage=requested_target_coverage,
+                effective_coverage=effective_target_coverage,
+                requested_uncertainty_method=requested_uncertainty_method,
+                effective_uncertainty_method=selected_uncertainty_method,
+                interval_source=interval_source_used,
+                calendar_covariates=covariates_used,
+                capacity_phases=[vars(p) for p in normalized_capacity_phases],
+                warnings=tuning_note,
+            ),
+            evaluation_summary,
+        ),
     )
 
 
@@ -1061,6 +1275,7 @@ def forecast_departments(
     uncertainty_method: Literal["prophet", "conformal", "auto"] = "conformal",
     changepoint_prior_scale: float = 0.05,
     interval_width: float = 0.90,
+    progress_callback=None,
 ) -> DepartmentForecastBundle:
     """Forecast each department independently with its own model selection.
 
@@ -1073,29 +1288,43 @@ def forecast_departments(
     if df is None:
         df = load_data(use_synthetic, filename, timeframe_start, timeframe_end)
 
-    validate_columns(df, ["Date", "Visits", "Department"])
-    df = df.copy()
-    df["Department"] = df["Department"].astype("string").str.strip()
-    df = df[df["Department"].notna() & df["Department"].ne("")]
-
+    report = inspect_data(df)
+    report.raise_if_invalid()
+    df = report.normalized.copy()
     all_departments = sorted(
-        str(department_name)
-        for department_name in df["Department"].unique()
+        str(department_name) for department_name in df["Department"].unique()
     )
+    available_departments = set(all_departments)
     if exclude_departments:
         excluded = {
-            str(department_name).strip()
-            for department_name in exclude_departments
+            str(department_name).strip() for department_name in exclude_departments
         }
         all_departments = [d for d in all_departments if d not in excluded]
-    if departments:
-        requested = {
-            str(department_name).strip()
-            for department_name in departments
-        }
+    if departments is not None:
+        requested = {str(department_name).strip() for department_name in departments}
+        unknown = requested.difference(available_departments)
+        if unknown:
+            raise ValueError(
+                f"No departments available for unknown requests. Unknown departments: {sorted(unknown)}"
+            )
         all_departments = [d for d in all_departments if d in requested]
     if not all_departments:
         raise ValueError("No departments available to forecast.")
+
+    report = inspect_data(df)
+    report.raise_if_invalid()
+    selected = report.normalized[report.normalized.Department.isin(all_departments)]
+    start = pd.Timestamp(timeframe_start).to_period("M").to_timestamp()
+    end = pd.Timestamp(timeframe_end).to_period("M").to_timestamp()
+    if start > end:
+        raise ValueError("timeframe_start must be on or before timeframe_end.")
+    selected = selected[selected.Date.between(start, end)]
+    if selected.empty:
+        raise ValueError("No data remains in the selected timeframe.")
+    common_origin = selected.Date.max()
+    expected_dates = pd.date_range(
+        common_origin + pd.offsets.MonthBegin(1), periods=forecast_periods, freq="MS"
+    )
 
     results: Dict[str, ForecastResult] = {}
     failures: Dict[str, str] = {}
@@ -1103,7 +1332,16 @@ def forecast_departments(
     combined_frames: list[pd.DataFrame] = []
 
     for department_name in all_departments:
+        if progress_callback is not None:
+            progress_callback(
+                f"Department {len(results) + len(failures) + 1}/{len(all_departments)}: {department_name}"
+            )
         try:
+            history = selected[selected.Department.eq(department_name)]
+            if history.empty or history.Date.max() != common_origin:
+                raise ValueError(
+                    f"History must reach the common forecast origin {common_origin:%Y-%m}; missing observations are not zero visits."
+                )
             result = forecast_visits(
                 df=df,
                 timeframe_start=timeframe_start,
@@ -1117,6 +1355,11 @@ def forecast_departments(
                 changepoint_prior_scale=changepoint_prior_scale,
                 interval_width=interval_width,
             )
+            actual_dates = pd.DatetimeIndex(result.future_forecast_df["ds"])
+            if not actual_dates.equals(expected_dates):
+                raise ValueError(
+                    "Forecast dates do not match the common department forecast calendar."
+                )
         except Exception as department_error:  # noqa: BLE001
             failures[department_name] = str(department_error)
             continue
@@ -1153,24 +1396,27 @@ def forecast_departments(
 
     per_department_df = pd.concat(combined_frames, ignore_index=True)
     combined_totals = (
-        per_department_df.groupby(["ds", "forecast_month"], as_index=False)[
+        per_department_df.groupby("ds", as_index=False)[
             ["yhat_original", "yhat_adjusted"]
         ]
         .sum()
-        .sort_values("forecast_month")
+        .sort_values("ds")
         .reset_index(drop=True)
     )
+    combined_totals["forecast_month"] = combined_totals["ds"].map(
+        {date: i for i, date in enumerate(expected_dates, 1)}
+    )
+    counts = per_department_df.groupby("ds")["Department"].nunique()
+    combined_totals["included_department_count"] = combined_totals["ds"].map(counts)
     total_is_complete = not failures
     combined_totals["Department"] = (
         "All (sum of departments)"
         if total_is_complete
-        else (
-            f"Partial total ({len(results)}/{len(all_departments)} "
-            "departments)"
-        )
+        else (f"Partial total ({len(results)}/{len(all_departments)} departments)")
     )
-    combined_totals["aggregate_complete"] = total_is_complete
-    combined_totals["included_department_count"] = len(results)
+    combined_totals["aggregate_complete"] = combined_totals[
+        "included_department_count"
+    ].eq(len(all_departments))
     combined_totals["requested_department_count"] = len(all_departments)
     per_department_df["aggregate_complete"] = pd.NA
     per_department_df["included_department_count"] = pd.NA

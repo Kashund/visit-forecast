@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import pandas as pd
 from typing import Any
 
-from visit_forecast import forecast_visits
+from visit_forecast import forecast_visits, forecast_departments
+from visit_forecast.exports import (
+    forecast_tables,
+    scenario_tables,
+    write_workflow_export,
+)
+from visit_forecast.provenance import build_run_manifest
 
 
 def _parse_phase_argument(phase_argument: str) -> dict[str, Any]:
@@ -70,32 +77,114 @@ def main() -> None:
         help="Forecast model. 'auto' backtests all models and picks the best.",
     )
 
+    parser.add_argument(
+        "--workflow",
+        choices=["forecast", "departments", "scenarios"],
+        default="forecast",
+    )
+    parser.add_argument("--calendar-covariates", action="store_true")
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Department to exclude; repeat as needed.",
+    )
+    parser.add_argument(
+        "--uncertainty", choices=["prophet", "conformal", "auto"], default="conformal"
+    )
+    parser.add_argument("--tuning", choices=["manual", "auto"], default="manual")
+    parser.add_argument(
+        "--candidates",
+        nargs="+",
+        choices=["prophet", "ets", "theta", "arima", "seasonal_naive"],
+    )
+    parser.add_argument(
+        "--output-dir", help="Write CSV, Excel, and a run manifest here."
+    )
+    parser.add_argument(
+        "--fiscal-view", choices=["month", "quarter", "year"], default="year"
+    )
+    parser.add_argument("--scenario-a-json", default="[]")
+    parser.add_argument("--scenario-b-json", default="[]")
     args = parser.parse_args()
     capacity_phases = _parse_capacity_phases(args)
 
-    result = forecast_visits(
+    common = dict(
         use_synthetic=args.use_synthetic,
         filename=args.filename,
         timeframe_start=args.start,
         timeframe_end=args.end,
         forecast_periods=args.months,
-        department=args.department,
-        adjustment_mode=args.adjustment_mode,
-        adjustment_percent=args.adjustment_percent,
-        adjustment_start_month=args.adjustment_start_month,
-        adjustment_end_month=args.adjustment_end_month,
-        capacity_phases=capacity_phases,
+        model_choice=args.model,
+        exclude_departments=args.exclude,
+        use_calendar_covariates=args.calendar_covariates,
+        uncertainty_method=args.uncertainty,
+        auto_candidates=args.candidates,
         changepoint_prior_scale=args.changepoint,
         interval_width=args.interval_width,
-        model_choice=args.model,
     )
-
-    print("Model:", result.selected_model)
-    if result.tuning_note:
+    if args.workflow == "departments":
+        bundle = forecast_departments(
+            **common,
+            departments=None if args.department == "All" else [args.department],
+        )
+        tables = {
+            "Model_Summary": bundle.summary_df,
+            "Forecasts_By_Department": bundle.combined_future_df,
+            "Failures": pd.DataFrame(
+                [{"Department": k, "Reason": v} for k, v in bundle.failures.items()],
+                columns=["Department", "Reason"],
+            ),
+            "Diagnostics": pd.concat(
+                [
+                    r.tuning_diagnostics_df.assign(Department=d)
+                    for d, r in bundle.results.items()
+                    if r.tuning_diagnostics_df is not None
+                ],
+                ignore_index=True,
+            )
+            if any(r.tuning_diagnostics_df is not None for r in bundle.results.values())
+            else pd.DataFrame(),
+        }
+        manifest = build_run_manifest(bundle.combined_future_df, vars(args))
+        manifest["department_runs"] = {
+            d: r.run_manifest for d, r in bundle.results.items()
+        }
+        print(bundle.summary_df.to_string(index=False))
+        if bundle.failures:
+            print("Partial forecast; failures:", bundle.failures)
+    else:
+        result = forecast_visits(
+            **common,
+            department=args.department,
+            tuning_mode=args.tuning,
+            adjustment_mode=args.adjustment_mode,
+            adjustment_percent=args.adjustment_percent,
+            adjustment_start_month=args.adjustment_start_month,
+            adjustment_end_month=args.adjustment_end_month,
+            capacity_phases=capacity_phases if args.workflow == "forecast" else [],
+        )
+        manifest = result.run_manifest
+        if args.workflow == "scenarios":
+            a, b = json.loads(args.scenario_a_json), json.loads(args.scenario_b_json)
+            monthly, fiscal, definitions = scenario_tables(result, a, b)
+            tables = {
+                "Monthly_Comparison": monthly,
+                "FY_Summary": fiscal,
+                "Scenario_Definitions": definitions,
+            }
+            manifest = {**manifest, "scenarios": {"A": a, "B": b}}
+        else:
+            tables = forecast_tables(result, args.fiscal_view)
+        print("Model:", result.selected_model)
         print("Note:", result.tuning_note)
-    print("Departments:", result.department_info)
-    print("Metrics:", result.performance_metrics)
-    print(result.fiscal_summary)
+        print("Departments:", result.department_info)
+        print("Metrics:", result.performance_metrics)
+        print("Evaluation:", result.evaluation_summary)
+        print(list(tables.values())[-1].to_string(index=False))
+    if args.output_dir:
+        write_workflow_export(args.output_dir, tables, manifest)
+        print("Exports written to", args.output_dir)
 
 
 if __name__ == "__main__":

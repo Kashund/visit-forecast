@@ -60,7 +60,9 @@ def test_select_prophet_hyperparameters_balances_mape_and_rmse_for_changepoint_s
     )
 
     result = select_prophet_hyperparameters(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=3,
     )
 
@@ -101,7 +103,9 @@ def test_select_prophet_hyperparameters_breaks_changepoint_ties_by_smaller_value
     )
 
     result = select_prophet_hyperparameters(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=3,
         changepoint_candidates=[0.03, 0.05],
         interval_width_candidates=[0.90],
@@ -129,7 +133,9 @@ def test_select_prophet_hyperparameters_records_interval_width_fallback_when_cv_
     )
 
     result = select_prophet_hyperparameters(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=3,
     )
 
@@ -153,7 +159,9 @@ def test_select_prophet_hyperparameters_skips_interval_width_tuning_for_conforma
     monkeypatch.setattr("visit_forecast.tuning.backtest", fake_backtest)
 
     result = select_prophet_hyperparameters(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=3,
         tune_interval_width=False,
         fixed_interval_width=0.92,
@@ -162,9 +170,7 @@ def test_select_prophet_hyperparameters_skips_interval_width_tuning_for_conforma
     assert result.interval_width == 0.92
     assert result.note is not None
     assert "fixed interval / target coverage" in result.note.lower()
-    assert (
-        result.diagnostics_df["parameter_family"] == "interval_width"
-    ).any()
+    assert (result.diagnostics_df["parameter_family"] == "interval_width").any()
 
 
 def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertainty(
@@ -218,7 +224,9 @@ def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertai
             pd.DataFrame(
                 {
                     "horizon": pd.to_timedelta(["30 days"]),
-                    "coverage": [prophet_coverage_by_cp[round(model.changepoint_prior_scale, 2)]],
+                    "coverage": [
+                        prophet_coverage_by_cp[round(model.changepoint_prior_scale, 2)]
+                    ],
                 }
             ),
         )
@@ -229,12 +237,18 @@ def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertai
         df_prepared, forecast_periods, changepoint_prior_scale, interval_width
     ):
         current_cp["value"] = round(changepoint_prior_scale, 2)
-        return DummySeries(), DummyForecast(), DummyModel(changepoint_prior_scale, interval_width)
+        return (
+            DummySeries(),
+            DummyForecast(),
+            DummyModel(changepoint_prior_scale, interval_width),
+        )
 
     def fake_backtest_with_method(model, series, forecast_horizon, start, stride):
         if round(model.interval_width, 2) == 0.85:
             return {
-                "MAPE": 10.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 9.5,
+                "MAPE": 10.0
+                if round(model.changepoint_prior_scale, 2) == 0.03
+                else 9.5,
                 "MAE": 4.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 3.5,
                 "RMSE": 5.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 4.6,
             }
@@ -244,7 +258,9 @@ def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertai
             "RMSE": 4.0 if round(model.changepoint_prior_scale, 2) == 0.03 else 3.8,
         }
 
-    monkeypatch.setattr("visit_forecast.tuning.fit_and_forecast", fake_fit_and_forecast_with_cp)
+    monkeypatch.setattr(
+        "visit_forecast.tuning.fit_and_forecast", fake_fit_and_forecast_with_cp
+    )
     monkeypatch.setattr("visit_forecast.tuning.backtest", fake_backtest_with_method)
     monkeypatch.setattr(
         "visit_forecast.tuning.prophet_cross_validation_metrics",
@@ -264,7 +280,9 @@ def test_select_joint_forecast_configuration_balances_model_metrics_and_uncertai
     )
 
     result = select_joint_forecast_configuration(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=1,
         target_coverage=0.90,
         changepoint_candidates=[0.03, 0.05],
@@ -330,7 +348,9 @@ def test_select_uncertainty_configuration_can_choose_optimal_target_coverage(
     )
 
     result = select_uncertainty_configuration(
-        df_prepared=pd.DataFrame({"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}),
+        df_prepared=pd.DataFrame(
+            {"ds": pd.date_range("2020-01-01", periods=12, freq="MS")}
+        ),
         forecast_periods=3,
         changepoint_prior_scale=0.03,
         target_coverage_candidates=[0.80, 0.90],
@@ -386,7 +406,9 @@ def test_forecast_visits_manual_preserves_selected_values(monkeypatch):
     monkeypatch.setattr(
         service, "prophet_future_intervals", lambda *args, **kwargs: pd.DataFrame()
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -453,7 +475,9 @@ def test_forecast_visits_auto_uses_tuned_values(monkeypatch):
     monkeypatch.setattr(
         service, "prophet_future_intervals", lambda *args, **kwargs: pd.DataFrame()
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -493,16 +517,18 @@ def test_forecast_visits_auto_uses_tuned_values(monkeypatch):
         tuning_mode="auto",
     )
 
-    assert fit_calls[-1] == (0.03, 0.95)
+    assert fit_calls[-1] == (0.03, 0.88)
     assert result.tuning_mode == "auto"
     assert result.selected_changepoint_prior_scale == 0.03
-    assert result.selected_interval_width == 0.95
+    assert result.selected_interval_width == 0.88
     assert result.tuning_primary_metric == "MAPE+RMSE"
     assert result.tuning_primary_score == 1.08
     assert result.tuning_diagnostics_df is not None
 
 
-def test_forecast_visits_conformal_scales_intervals_with_capacity_adjustments(monkeypatch):
+def test_forecast_visits_conformal_scales_intervals_with_capacity_adjustments(
+    monkeypatch,
+):
     monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
     monkeypatch.setattr(
         service,
@@ -585,7 +611,9 @@ def test_forecast_visits_conformal_scales_intervals_with_capacity_adjustments(mo
             },
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -612,7 +640,9 @@ def test_forecast_visits_conformal_scales_intervals_with_capacity_adjustments(mo
     assert result.interval_summary_metrics["empirical_coverage_overall"] == 0.91
 
 
-def test_forecast_visits_auto_skips_interval_width_tuning_in_conformal_mode(monkeypatch):
+def test_forecast_visits_auto_skips_interval_width_tuning_in_conformal_mode(
+    monkeypatch,
+):
     select_calls = []
 
     monkeypatch.setattr(service, "load_data", lambda *args, **kwargs: pd.DataFrame())
@@ -671,7 +701,9 @@ def test_forecast_visits_auto_skips_interval_width_tuning_in_conformal_mode(monk
             }
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -689,7 +721,9 @@ def test_forecast_visits_auto_skips_interval_width_tuning_in_conformal_mode(monk
             diagnostics_df=pd.DataFrame(),
         )
 
-    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+    monkeypatch.setattr(
+        service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters
+    )
 
     result = service.forecast_visits(
         use_synthetic=False,
@@ -763,7 +797,9 @@ def test_forecast_visits_auto_tune_respects_manual_prophet_interval(monkeypatch)
             }
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -789,7 +825,9 @@ def test_forecast_visits_auto_tune_respects_manual_prophet_interval(monkeypatch)
             diagnostics_df=pd.DataFrame(),
         )
 
-    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+    monkeypatch.setattr(
+        service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters
+    )
 
     result = service.forecast_visits(
         use_synthetic=False,
@@ -897,7 +935,9 @@ def test_forecast_visits_second_manual_conformal_run_updates_target_coverage_eve
             },
         )
 
-    monkeypatch.setattr(service, "build_conformal_intervals", fake_build_conformal_intervals)
+    monkeypatch.setattr(
+        service, "build_conformal_intervals", fake_build_conformal_intervals
+    )
     monkeypatch.setattr(
         service,
         "prophet_future_intervals",
@@ -909,7 +949,9 @@ def test_forecast_visits_second_manual_conformal_run_updates_target_coverage_eve
             }
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -934,7 +976,9 @@ def test_forecast_visits_second_manual_conformal_run_updates_target_coverage_eve
             diagnostics_df=pd.DataFrame(),
         )
 
-    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+    monkeypatch.setattr(
+        service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters
+    )
 
     first_result = service.forecast_visits(
         use_synthetic=False,
@@ -1049,7 +1093,9 @@ def test_forecast_visits_auto_selects_best_uncertainty_method(monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -1135,7 +1181,9 @@ def test_forecast_visits_joint_auto_uses_joint_selector(monkeypatch):
         "collect_conformal_residuals",
         lambda **kwargs: pd.DataFrame({"residual": [2.0]}),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -1174,7 +1222,8 @@ def test_forecast_visits_joint_auto_uses_joint_selector(monkeypatch):
     assert select_calls[0]["target_coverage"] == 0.92
     assert result.uncertainty_method == "conformal"
     assert result.joint_auto_tuning_enabled is True
-    assert result.selected_interval_width == 0.90
+    assert result.selected_interval_width == 0.92
+    assert select_calls[0]["interval_width_candidates"] == [0.92]
     assert result.target_coverage == 0.92
 
 
@@ -1271,7 +1320,9 @@ def test_forecast_visits_auto_auto_with_joint_toggle_off_uses_separate_passes(
             },
         ),
     )
-    monkeypatch.setattr(service, "prophet_full_forecast_df", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        service, "prophet_full_forecast_df", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(
         service,
         "prophet_cross_validation_metrics",
@@ -1288,7 +1339,9 @@ def test_forecast_visits_auto_auto_with_joint_toggle_off_uses_separate_passes(
     monkeypatch.setattr(
         service,
         "select_joint_forecast_configuration",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("joint selector should not run")),
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("joint selector should not run")
+        ),
     )
 
     def fake_select_prophet_hyperparameters(**kwargs):
@@ -1320,7 +1373,9 @@ def test_forecast_visits_auto_auto_with_joint_toggle_off_uses_separate_passes(
             uncertainty_method="conformal",
         )
 
-    monkeypatch.setattr(service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters)
+    monkeypatch.setattr(
+        service, "select_prophet_hyperparameters", fake_select_prophet_hyperparameters
+    )
     monkeypatch.setattr(
         service,
         "select_uncertainty_configuration",
@@ -1344,7 +1399,8 @@ def test_forecast_visits_auto_auto_with_joint_toggle_off_uses_separate_passes(
     assert uncertainty_selection_calls
     assert result.uncertainty_method == "conformal"
     assert result.joint_auto_tuning_enabled is False
-    assert result.selected_interval_width == 0.80
-    assert result.target_coverage == 0.80
+    assert result.selected_interval_width == 0.92
+    assert uncertainty_selection_calls[0]["target_coverage_candidates"] == [0.92]
+    assert result.target_coverage == 0.92
     assert result.tuning_note is not None
     assert "separate passes" in result.tuning_note.lower()

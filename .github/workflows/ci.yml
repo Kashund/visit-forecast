@@ -33,3 +33,9 @@ jobs:
         run: uv run --no-editable python -m compileall -q src apps scripts
       - name: Build wheel
         run: uv build --wheel
+      - name: Verify isolated wheel workflow
+        run: |
+          uv pip install --python .venv/bin/python --no-deps --reinstall dist/visit_forecast-*.whl
+          project_root="$PWD"
+          cd "$(mktemp -d)"
+          "$project_root/.venv/bin/python" -I "$project_root/scripts/verify_installed_package.py"

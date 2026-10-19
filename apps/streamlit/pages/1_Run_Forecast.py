@@ -3,9 +3,11 @@ from __future__ import annotations
 from bootstrap import ensure_project_paths
 import streamlit as st
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
 ensure_project_paths()
+
+from visit_forecast.provenance import configuration_fingerprint, manifest_json
 
 from visit_forecast import forecast_visits
 from visit_forecast.cv import add_prophet_cv_indicators
@@ -17,6 +19,7 @@ from components.sidebar import sidebar_controls
 from components.charts import forecast_line_chart, fiscal_bar_chart
 from state import (
     apply_forecast_run_to_session,
+    cached_forecast,
     clear_persisted_history,
     ensure_history_loaded,
     history_persistence_enabled,
@@ -46,6 +49,8 @@ def _timeseries_to_pd(ts) -> pd.DataFrame:
 
 
 def _score_label(metric_name: str, value: float, baseline: float | None = None):
+    if pd.isna(value):
+        return ("Unavailable", "⚪️")
     if metric_name.upper() == "MAPE":
         # Backtest MAPE is already expressed in percent. A value like 0.8
         # means 0.8% error (excellent) and must not be rescaled to 80%.
@@ -180,7 +185,9 @@ def _style_prophet_cv_table(cv_display_df: pd.DataFrame):
 
     styler = display_df.style.format({**numeric_formatters, **timedelta_formatters})
     for column_name in status_columns:
-        styler = styler.map(lambda value: status_styles.get(str(value), ""), subset=[column_name])
+        styler = styler.map(
+            lambda value: status_styles.get(str(value), ""), subset=[column_name]
+        )
     return styler
 
 
@@ -217,7 +224,8 @@ def _style_interval_validation_table(interval_df: pd.DataFrame):
         column_name: "{:.4f}"
         for column_name in display_df.columns
         if pd.api.types.is_numeric_dtype(display_df[column_name])
-        and column_name not in {"horizon_step", "Horizon_Days", "n_calibration_forecasts"}
+        and column_name
+        not in {"horizon_step", "Horizon_Days", "n_calibration_forecasts"}
     }
     for integer_column in ["horizon_step", "Horizon_Days", "n_calibration_forecasts"]:
         if integer_column in display_df.columns:
@@ -264,6 +272,7 @@ with st.sidebar.expander("Forecast run history", expanded=False):
         )
     if st.button("Clear forecast history", key="clear_history"):
         st.session_state["forecast_history"] = []
+        st.session_state.pop("forecast_cache", None)
         clear_persisted_history()
         # also clear current result
         if "forecast_result" in st.session_state:
@@ -292,26 +301,51 @@ common = dict(
     joint_auto_tuning_enabled=bool(controls["joint_auto_tuning_enabled"]),
 )
 
-# --- Compute only when Run clicked ---
+input_signature = configuration_fingerprint(
+    {**common, "source_mode": controls["source_mode"]}, df_preview
+)
+# Compute only for a deliberate new run. Views and fiscal rollups reuse results.
 if controls["run"]:
-    with st.spinner("Running forecast..."):
-        if controls["source_mode"] == "Use synthetic sample":
-            result = forecast_visits(use_synthetic=True, **common)
-        else:
-            if df_preview is None:
-                st.error("No data provided. Upload a file or paste CSV values first.")
-                st.stop()
-            result = forecast_visits(df=df_preview, **common)
+    try:
+        with st.spinner("Running forecast and validation..."):
+            if controls["source_mode"] == "Use synthetic sample":
+                from visit_forecast.io import generate_synthetic_data
 
-    scenario_summary = _build_phase_scenario_summary(controls["capacity_phases"])
-    apply_forecast_run_to_session(
-        st.session_state,
-        common=common,
-        result=result,
-        source_mode=controls["source_mode"],
-        scenario_summary=scenario_summary,
-        run_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                raw = generate_synthetic_data(
+                    common["timeframe_start"], common["timeframe_end"]
+                )
+            else:
+                if df_preview is None:
+                    st.error("Upload a file or paste CSV values first.")
+                    st.stop()
+                raw = df_preview
+            progress = st.empty()
+            result = cached_forecast(
+                st.session_state, raw, common, progress_callback=progress.caption
+            )
+            progress.empty()
+        st.session_state["shared_dataset"] = raw.copy()
+        st.session_state["forecast_input_signature"] = input_signature
+        scenario_summary = _build_phase_scenario_summary(controls["capacity_phases"])
+        apply_forecast_run_to_session(
+            st.session_state,
+            common=common,
+            result=result,
+            source_mode=controls["source_mode"],
+            scenario_summary=scenario_summary,
+            run_time=datetime.now(timezone.utc).isoformat(),
+        )
+    except Exception as exc:
+        st.error(f"Forecast failed: {exc}")
+        st.stop()
+if "forecast_result" in st.session_state and input_signature != st.session_state.get(
+    "forecast_input_signature"
+):
+    st.warning(
+        "Inputs changed. Results and exports still describe the previous run. Click Run forecast to update."
     )
+if st.session_state.get("history_save_error"):
+    st.warning(st.session_state["history_save_error"])
 
 # If no stored result, prompt
 if "forecast_result" not in st.session_state:
@@ -325,6 +359,29 @@ if "forecast_result" not in st.session_state:
     st.stop()
 
 result = st.session_state["forecast_result"]
+if result.run_manifest:
+    st.download_button(
+        "Download run manifest (JSON)",
+        manifest_json(result.run_manifest),
+        file_name="run_manifest.json",
+        mime="application/json",
+    )
+evaluation = result.evaluation_summary or {}
+if evaluation.get("mode") == "reserved_final_block":
+    st.info(
+        f"Validation uses a reserved final block: {evaluation['evaluation_start']} to {evaluation['evaluation_end']}. Configuration selection ended {evaluation['training_end']}. Final forecast fitting uses all history."
+    )
+    if evaluation.get("coverage") is not None:
+        st.caption(
+            f"Reserved-block baseline interval coverage: {evaluation['coverage']:.1%}. One forecast origin; not a coverage guarantee."
+        )
+else:
+    st.caption(
+        evaluation.get(
+            "coverage_note",
+            "Development backtest; independent final evaluation unavailable.",
+        )
+    )
 
 # Baseline for normalized MAE/RMSE interpretation
 series_df = _timeseries_to_pd(result.series).reset_index()
@@ -366,7 +423,7 @@ c3.metric("RMSE", f"{rmse_v:.4f}", f"{rmse_icon} {rmse_label}")
 if baseline and baseline > 0:
     st.caption(
         f"Normalization baseline (mean actual visits): {baseline:.2f}  •  "
-        f"MAE/mean={mae_v/baseline:.2%}  •  RMSE/mean={rmse_v/baseline:.2%}"
+        f"MAE/mean={mae_v / baseline:.2%}  •  RMSE/mean={rmse_v / baseline:.2%}"
     )
 
 st.caption(
@@ -382,12 +439,14 @@ model_display_names = {
 }
 selected_model_name = getattr(result, "selected_model", "prophet")
 requested_model_name = getattr(result, "requested_model", selected_model_name)
-model_caption = f"Model: {model_display_names.get(selected_model_name, selected_model_name)}"
+model_caption = (
+    f"Model: {model_display_names.get(selected_model_name, selected_model_name)}"
+)
 if requested_model_name == "auto":
     model_caption += " (auto-selected)"
 st.caption(f"{model_caption}  •  Departments included: {result.department_info}")
 
-if result.tuning_mode == "auto":
+if result.tuning_mode == "auto" and selected_model_name == "prophet":
     t1, t2, t3 = st.columns(3)
     t1.metric(
         "Auto-tuned CP",
@@ -431,11 +490,16 @@ if result.tuning_diagnostics_df is not None and not result.tuning_diagnostics_df
         )
 
 st.markdown("---")
-st.subheader("Interval validation")
+st.subheader("Interval validation (development diagnostics)")
+st.caption(
+    "These diagnostics can inform selection; reserved-block coverage is reported separately above when sufficient history exists."
+)
 
 interval_summary = getattr(result, "interval_summary_metrics", {}) or {}
 interval_diagnostics_df = getattr(result, "interval_diagnostics_df", None)
-interval_source = str(interval_summary.get("interval_source_used", result.uncertainty_method))
+interval_source = str(
+    interval_summary.get("interval_source_used", result.uncertainty_method)
+)
 target_coverage = float(interval_summary.get("target_coverage", result.target_coverage))
 empirical_coverage = interval_summary.get("empirical_coverage_overall", float("nan"))
 coverage_status = _coverage_check(empirical_coverage, target_coverage)
@@ -462,14 +526,17 @@ if requested_uncertainty_method != result.uncertainty_method:
 
 avg_interval_width = interval_summary.get("avg_interval_width")
 median_interval_width = interval_summary.get("median_interval_width")
-interval_width_over_mean_actual = interval_summary.get("interval_width_over_mean_actual")
+interval_width_over_mean_actual = interval_summary.get(
+    "interval_width_over_mean_actual"
+)
 fallback_used = bool(interval_summary.get("fallback_used", False))
 n_calibration_forecasts = int(interval_summary.get("n_calibration_forecasts", 0) or 0)
 
 st.caption(
     f"Calibration rows: {n_calibration_forecasts}  •  "
-    f"Average interval width: {avg_interval_width:.2f}" if pd.notna(avg_interval_width) else
-    f"Calibration rows: {n_calibration_forecasts}  •  Average interval width: n/a"
+    f"Average interval width: {avg_interval_width:.2f}"
+    if pd.notna(avg_interval_width)
+    else f"Calibration rows: {n_calibration_forecasts}  •  Average interval width: n/a"
 )
 st.caption(
     f"Median interval width: {median_interval_width:.2f}  •  "
@@ -485,6 +552,10 @@ if interval_source == "conformal":
         st.caption(
             "Fallback used for at least one horizon because there were fewer than 8 calibration residuals for that step."
         )
+elif interval_source == "rmse_approx":
+    st.warning(
+        "Approximate normal RMSE bounds are shown and exported; calibrated coverage is unavailable."
+    )
 else:
     st.caption(
         "Prophet interval coverage is summarized from Prophet cross-validation metrics. Detailed Prophet-native diagnostics remain in the CV section below."
@@ -521,9 +592,7 @@ if interval_diagnostics_df is not None and not interval_diagnostics_df.empty:
         ]
     )
     st.dataframe(
-        _style_interval_validation_table(
-            display_interval_df[ordered_interval_columns]
-        ),
+        _style_interval_validation_table(display_interval_df[ordered_interval_columns]),
         width="stretch",
     )
 else:
@@ -618,6 +687,11 @@ result_sections = [
     "📊 Prophet CV",
     "🧩 Prophet Plots",
 ]
+if selected_model_name != "prophet":
+    result_sections = result_sections[:-2]
+if st.session_state.get("forecast_results_section") not in result_sections:
+    st.session_state["forecast_results_section"] = result_sections[0]
+
 if "forecast_results_section" not in st.session_state:
     st.session_state["forecast_results_section"] = result_sections[0]
 
@@ -630,10 +704,8 @@ selected_results_section = st.segmented_control(
 
 if selected_results_section == "📉 Forecast":
     active_interval_source = (
-        (getattr(result, "interval_summary_metrics", {}) or {}).get(
-            "interval_source_used", result.uncertainty_method
-        )
-    )
+        getattr(result, "interval_summary_metrics", {}) or {}
+    ).get("interval_source_used", result.uncertainty_method)
     fig = forecast_line_chart(
         result.future_forecast_df,
         mae=mae_v,
@@ -669,66 +741,44 @@ elif selected_results_section == "📅 Future Table":
 elif selected_results_section == "🏛️ Fiscal Summary":
     fiscal_summary_mode = st.radio(
         "Fiscal summary granularity",
-        ["Fiscal Year", "Fiscal Quarter"],
+        ["Fiscal Month", "Fiscal Quarter", "Fiscal Year"],
+        index=2,
         horizontal=True,
         key="fiscal_summary_granularity",
     )
-
-    selected_fiscal_summary = result.fiscal_summary
-    chart_fiscal_summary = selected_fiscal_summary
-    selected_period_column = "Fiscal_Year"
-    selected_export_filename = "fiscal_summary_year.csv"
-
-    if fiscal_summary_mode == "Fiscal Quarter":
-        series_dataframe = _timeseries_to_pd(result.series).reset_index()
-        datetime_column_candidates = [
-            column_name
-            for column_name in ["ds", "time", "date", "index"]
-            if column_name in series_dataframe.columns
-        ]
-        if not datetime_column_candidates:
-            st.error("Could not identify a datetime column for fiscal aggregation.")
-            st.stop()
-
-        value_column_candidates = [
-            column_name
-            for column_name in series_dataframe.columns
-            if column_name not in datetime_column_candidates
-        ]
-        if not value_column_candidates:
-            st.error("Could not identify a value column for fiscal aggregation.")
-            st.stop()
-
-        historical_dataframe = series_dataframe.rename(
-            columns={
-                datetime_column_candidates[0]: "ds",
-                value_column_candidates[0]: "y",
-            }
-        )[["ds", "y"]]
-
-        chart_fiscal_summary = aggregate_summary_by_period(
-            historical_dataframe,
-            result.future_forecast_df,
-            period="quarter",
-        )
-        selected_fiscal_summary = append_fiscal_year_totals(chart_fiscal_summary)
-        selected_period_column = "Fiscal_Period_Label"
-        selected_export_filename = "fiscal_summary_quarter.csv"
-
-    st.dataframe(
-        _style_fiscal_summary_table(selected_fiscal_summary),
+    period = {
+        "Fiscal Month": "month",
+        "Fiscal Quarter": "quarter",
+        "Fiscal Year": "year",
+    }[fiscal_summary_mode]
+    history = _timeseries_to_pd(result.series).reset_index()
+    history = history.rename(
+        columns={history.columns[0]: "ds", history.columns[1]: "y"}
+    )[["ds", "y"]]
+    chart_summary = aggregate_summary_by_period(
+        history, result.future_forecast_df, period=period
+    )
+    table_summary = (
+        append_fiscal_year_totals(chart_summary)
+        if period == "quarter"
+        else chart_summary
+    )
+    st.caption(
+        "Fiscal year: April–March. Historical, original forecast, and adjusted forecast are separate series. Partial periods show only the available months; missing values are not zero visits."
+    )
+    st.dataframe(_style_fiscal_summary_table(table_summary), width="stretch")
+    st.plotly_chart(
+        fiscal_bar_chart(
+            chart_summary,
+            period_column="Fiscal_Year" if period == "year" else "Fiscal_Period_Label",
+            title_text=f"{fiscal_summary_mode} Visits",
+        ),
         width="stretch",
     )
-    fig2 = fiscal_bar_chart(
-        chart_fiscal_summary, period_column=selected_period_column
-    )
-    if fig2 is not None:
-        st.plotly_chart(fig2, width="stretch")
-
     st.download_button(
         "Download fiscal summary CSV",
-        data=selected_fiscal_summary.to_csv(index=False).encode("utf-8"),
-        file_name=selected_export_filename,
+        data=table_summary.to_csv(index=False).encode("utf-8"),
+        file_name=f"fiscal_summary_{period}.csv",
         mime="text/csv",
     )
 
@@ -891,8 +941,18 @@ elif selected_results_section == "🧩 Prophet Plots":
                     yearly_df.groupby("month")["yearly"].mean().reindex(range(1, 13))
                 )
                 month_labels = [
-                    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+                    "Jan",
+                    "Feb",
+                    "Mar",
+                    "Apr",
+                    "May",
+                    "Jun",
+                    "Jul",
+                    "Aug",
+                    "Sep",
+                    "Oct",
+                    "Nov",
+                    "Dec",
                 ]
                 component_fig.add_trace(
                     go.Scatter(
@@ -913,20 +973,29 @@ elif selected_results_section == "🧩 Prophet Plots":
                 if lower_column in dfp.columns and upper_column in dfp.columns:
                     component_fig.add_trace(
                         go.Scatter(
-                            x=dfp["ds"], y=dfp[upper_column], mode="lines",
-                            line=dict(dash="dot"), name=upper_column,
+                            x=dfp["ds"],
+                            y=dfp[upper_column],
+                            mode="lines",
+                            line=dict(dash="dot"),
+                            name=upper_column,
                         )
                     )
                     component_fig.add_trace(
                         go.Scatter(
-                            x=dfp["ds"], y=dfp[lower_column], mode="lines",
-                            line=dict(dash="dot"), name=lower_column,
-                            fill="tonexty", fillcolor="rgba(0,0,0,0.08)",
+                            x=dfp["ds"],
+                            y=dfp[lower_column],
+                            mode="lines",
+                            line=dict(dash="dot"),
+                            name=lower_column,
+                            fill="tonexty",
+                            fillcolor="rgba(0,0,0,0.08)",
                         )
                     )
                 component_fig.add_trace(
                     go.Scatter(
-                        x=dfp["ds"], y=dfp[component_name], mode="lines",
+                        x=dfp["ds"],
+                        y=dfp[component_name],
+                        mode="lines",
                         name=component_name,
                     )
                 )

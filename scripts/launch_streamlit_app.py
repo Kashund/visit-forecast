@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 import webbrowser
+from urllib.request import urlopen
+from urllib.error import URLError
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -87,15 +89,25 @@ def main() -> int:
         return 1
 
     launch_environment = os.environ.copy()
-    pythonpath_entries = [str(source_root)]
+    pythonpath_entries = [str(app_file_path.parent), str(source_root)]
     existing_pythonpath = launch_environment.get("PYTHONPATH")
     if existing_pythonpath:
         pythonpath_entries.append(existing_pythonpath)
     launch_environment["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-    # This launcher binds only to localhost, so cross-session history is safe
-    # and convenient. Hosted deployments remain session-only unless their
-    # operator deliberately enables persistence.
+    # Intended for one local user. A shared machine still requires separate
+    # accounts/history directories; localhost alone does not isolate users.
     launch_environment.setdefault("VISIT_FORECAST_PERSIST_HISTORY", "1")
+
+    # Refuse an occupied port instead of opening an unrelated process.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        try:
+            probe.bind((host, port))
+        except OSError:
+            print(
+                f"Port {port} is already in use. Stop that listener or launch Streamlit on another port.",
+                file=sys.stderr,
+            )
+            return 1
 
     streamlit_process = subprocess.Popen(
         launch_command,
@@ -103,15 +115,27 @@ def main() -> int:
         env=launch_environment,
     )
 
-    if wait_for_port(host=host, port=port, timeout_seconds=30):
+    deadline = time.monotonic() + 30
+    ready = False
+    while time.monotonic() < deadline and streamlit_process.poll() is None:
+        try:
+            with urlopen(f"{application_url}/_stcore/health", timeout=1) as response:
+                ready = response.status == 200 and response.read().strip() == b"ok"
+            if ready:
+                break
+        except (URLError, OSError):
+            pass
+        time.sleep(0.2)
+    if ready and streamlit_process.poll() is None:
         webbrowser.open(application_url)
         print(f"Opened {application_url}")
     else:
         print(
-            "Streamlit did not become available within 30 seconds. "
-            f"Open {application_url} manually.",
+            "Streamlit failed its health check; inspect startup output.",
             file=sys.stderr,
         )
+        streamlit_process.terminate()
+        return streamlit_process.wait() or 1
 
     try:
         return streamlit_process.wait()

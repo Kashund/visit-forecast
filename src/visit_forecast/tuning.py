@@ -51,8 +51,13 @@ def _cv_parameter_sets(forecast_periods: int) -> list[tuple[str, dict[str, str]]
     ]
 
 
-def _longest_horizon_gap(cv_metrics_df: pd.DataFrame, candidate_interval_width: float) -> float:
-    coverage_gap = (pd.to_numeric(cv_metrics_df["coverage"], errors="coerce") - candidate_interval_width).abs()
+def _longest_horizon_gap(
+    cv_metrics_df: pd.DataFrame, candidate_interval_width: float
+) -> float:
+    coverage_gap = (
+        pd.to_numeric(cv_metrics_df["coverage"], errors="coerce")
+        - candidate_interval_width
+    ).abs()
     if "horizon" not in cv_metrics_df.columns:
         return float(coverage_gap.iloc[-1])
 
@@ -73,7 +78,11 @@ def _summarize_prophet_interval_validation(
     cv_metrics_df: pd.DataFrame | None,
     target_coverage: float,
 ) -> dict[str, float]:
-    if cv_metrics_df is None or cv_metrics_df.empty or "coverage" not in cv_metrics_df.columns:
+    if (
+        cv_metrics_df is None
+        or cv_metrics_df.empty
+        or "coverage" not in cv_metrics_df.columns
+    ):
         return {
             "empirical_coverage_overall": float("nan"),
             "coverage_gap": float("nan"),
@@ -107,7 +116,9 @@ def _timeseries_to_forecast_frame(forecast) -> pd.DataFrame:
     elif hasattr(forecast, "pandas_dataframe"):
         fc_df = forecast.pandas_dataframe().reset_index()
     else:
-        raise AttributeError("Unsupported Darts TimeSeries version: cannot convert forecast.")
+        raise AttributeError(
+            "Unsupported Darts TimeSeries version: cannot convert forecast."
+        )
 
     time_col = next(
         (c for c in ["ds", "time", "index", "Date", "date"] if c in fc_df.columns),
@@ -129,7 +140,9 @@ def _timeseries_to_forecast_frame(forecast) -> pd.DataFrame:
         numeric = [c for c in numeric if c.lower() != "index"] or numeric
         value_col = numeric[0] if numeric else value_cols[0]
 
-    future_df = fc_df.rename(columns={value_col: "yhat_original"})[["ds", "yhat_original"]]
+    future_df = fc_df.rename(columns={value_col: "yhat_original"})[
+        ["ds", "yhat_original"]
+    ]
     future_df["yhat_original"] = pd.to_numeric(
         future_df["yhat_original"], errors="coerce"
     ).astype(float)
@@ -144,6 +157,7 @@ def _summarize_conformal_interval_validation(
     forecast,
     forecast_periods: int,
     target_coverage: float,
+    future_covariates=None,
 ) -> dict[str, float]:
     residuals_df = collect_conformal_residuals(
         model=model,
@@ -151,6 +165,11 @@ def _summarize_conformal_interval_validation(
         forecast_horizon=forecast_periods,
         start=0.7,
         stride=1,
+        **(
+            {"future_covariates": future_covariates}
+            if future_covariates is not None
+            else {}
+        ),
     )
     future_df = _timeseries_to_forecast_frame(forecast)
     _, _, summary = build_conformal_intervals(
@@ -174,6 +193,7 @@ def _evaluate_changepoint_candidates(
     df_prepared: pd.DataFrame,
     forecast_periods: int,
     changepoint_candidates: Iterable[float],
+    future_covariates=None,
 ) -> tuple[float, float | None, pd.DataFrame, str | None]:
     rows = []
     for candidate in changepoint_candidates:
@@ -196,6 +216,11 @@ def _evaluate_changepoint_candidates(
                 forecast_periods=forecast_periods,
                 changepoint_prior_scale=float(candidate),
                 interval_width=DEFAULT_INTERVAL_WIDTH_FALLBACK,
+                **(
+                    {"future_covariates": future_covariates}
+                    if future_covariates is not None
+                    else {}
+                ),
             )
             metrics = backtest(
                 model=model,
@@ -203,6 +228,11 @@ def _evaluate_changepoint_candidates(
                 forecast_horizon=forecast_periods,
                 start=0.7,
                 stride=forecast_periods,
+                **(
+                    {"future_covariates": future_covariates}
+                    if future_covariates is not None
+                    else {}
+                ),
             )
             row["rmse"] = float(metrics.get("RMSE", float("nan")))
             row["mape"] = float(metrics.get("MAPE", float("nan")))
@@ -244,7 +274,12 @@ def _evaluate_changepoint_candidates(
         diagnostics_df["candidate_value"] == selected_value,
         "selected",
     ] = True
-    return selected_value, float(selected_row["primary_score_value"]), diagnostics_df, None
+    return (
+        selected_value,
+        float(selected_row["primary_score_value"]),
+        diagnostics_df,
+        None,
+    )
 
 
 def _evaluate_interval_width_candidates(
@@ -252,6 +287,7 @@ def _evaluate_interval_width_candidates(
     forecast_periods: int,
     changepoint_prior_scale: float,
     interval_width_candidates: Iterable[float],
+    future_covariates=None,
 ) -> tuple[float, pd.DataFrame, str | None]:
     attempted_diagnostics = pd.DataFrame()
     fallback_note = None
@@ -275,6 +311,11 @@ def _evaluate_interval_width_candidates(
                     forecast_periods=forecast_periods,
                     changepoint_prior_scale=changepoint_prior_scale,
                     interval_width=float(candidate),
+                    **(
+                        {"future_covariates": future_covariates}
+                        if future_covariates is not None
+                        else {}
+                    ),
                 )
                 _, cv_metrics = prophet_cross_validation_metrics(model, **cv_params)
                 if (
@@ -283,7 +324,8 @@ def _evaluate_interval_width_candidates(
                     and "coverage" in cv_metrics.columns
                 ):
                     coverage_gap = (
-                        pd.to_numeric(cv_metrics["coverage"], errors="coerce") - float(candidate)
+                        pd.to_numeric(cv_metrics["coverage"], errors="coerce")
+                        - float(candidate)
                     ).abs()
                     row["primary_score_value"] = float(coverage_gap.mean())
                     row["tie_breaker_value"] = _longest_horizon_gap(
@@ -334,11 +376,19 @@ def select_prophet_hyperparameters(
     interval_width_candidates: Iterable[float] = DEFAULT_INTERVAL_WIDTH_CANDIDATES,
     tune_interval_width: bool = True,
     fixed_interval_width: float = DEFAULT_INTERVAL_WIDTH_FALLBACK,
+    future_covariates=None,
 ) -> TuningSelection:
-    selected_cp, balanced_score, cp_diagnostics_df, cp_note = _evaluate_changepoint_candidates(
-        df_prepared=df_prepared,
-        forecast_periods=forecast_periods,
-        changepoint_candidates=changepoint_candidates,
+    selected_cp, balanced_score, cp_diagnostics_df, cp_note = (
+        _evaluate_changepoint_candidates(
+            df_prepared=df_prepared,
+            forecast_periods=forecast_periods,
+            changepoint_candidates=changepoint_candidates,
+            **(
+                {"future_covariates": future_covariates}
+                if future_covariates is not None
+                else {}
+            ),
+        )
     )
 
     if tune_interval_width:
@@ -347,6 +397,11 @@ def select_prophet_hyperparameters(
             forecast_periods=forecast_periods,
             changepoint_prior_scale=selected_cp,
             interval_width_candidates=interval_width_candidates,
+            **(
+                {"future_covariates": future_covariates}
+                if future_covariates is not None
+                else {}
+            ),
         )
     else:
         selected_iw = float(fixed_interval_width)
@@ -389,13 +444,16 @@ def select_joint_forecast_configuration(
     target_coverage: float,
     changepoint_candidates: Iterable[float] = DEFAULT_CHANGEPOINT_CANDIDATES,
     interval_width_candidates: Iterable[float] = DEFAULT_INTERVAL_WIDTH_CANDIDATES,
+    future_covariates=None,
 ) -> TuningSelection:
     rows: list[dict[str, object]] = []
 
     for changepoint_candidate in changepoint_candidates:
         for method_name in ["prophet", "conformal"]:
             candidate_interval_widths = (
-                interval_width_candidates if method_name == "prophet" else [target_coverage]
+                interval_width_candidates
+                if method_name == "prophet"
+                else [target_coverage]
             )
             for interval_width in candidate_interval_widths:
                 row = {
@@ -424,6 +482,11 @@ def select_joint_forecast_configuration(
                         forecast_periods=forecast_periods,
                         changepoint_prior_scale=float(changepoint_candidate),
                         interval_width=float(interval_width),
+                        **(
+                            {"future_covariates": future_covariates}
+                            if future_covariates is not None
+                            else {}
+                        ),
                     )
                     point_metrics = backtest(
                         model=model,
@@ -431,6 +494,11 @@ def select_joint_forecast_configuration(
                         forecast_horizon=forecast_periods,
                         start=0.7,
                         stride=forecast_periods,
+                        **(
+                            {"future_covariates": future_covariates}
+                            if future_covariates is not None
+                            else {}
+                        ),
                     )
                     row["mape"] = float(point_metrics.get("MAPE", float("nan")))
                     row["mae"] = float(point_metrics.get("MAE", float("nan")))
@@ -454,6 +522,11 @@ def select_joint_forecast_configuration(
                             forecast=forecast,
                             forecast_periods=forecast_periods,
                             target_coverage=float(target_coverage),
+                            **(
+                                {"future_covariates": future_covariates}
+                                if future_covariates is not None
+                                else {}
+                            ),
                         )
 
                     row["empirical_coverage"] = float(
@@ -463,7 +536,9 @@ def select_joint_forecast_configuration(
                         interval_summary.get("coverage_gap", float("nan"))
                     )
                     row["interval_width_over_mean_actual"] = float(
-                        interval_summary.get("interval_width_over_mean_actual", float("nan"))
+                        interval_summary.get(
+                            "interval_width_over_mean_actual", float("nan")
+                        )
                     )
                     row["fallback_used"] = bool(
                         interval_summary.get("fallback_used", False)
@@ -478,19 +553,23 @@ def select_joint_forecast_configuration(
                 rows.append(row)
 
     diagnostics_df = pd.DataFrame(rows)
-    valid_rows = diagnostics_df.dropna(subset=["mape", "mae", "rmse", "coverage_gap"]).copy()
+    valid_rows = diagnostics_df.dropna(
+        subset=["mape", "mae", "rmse", "coverage_gap"]
+    ).copy()
     if valid_rows.empty:
         diagnostics_df.loc[
-            diagnostics_df["candidate_value"].eq("prophet|cp=0.05|iw=0.90"),
+            diagnostics_df["candidate_value"].eq(
+                f"prophet|cp=0.05|iw={target_coverage:.2f}"
+            ),
             "selected",
         ] = True
         note = (
             "Joint auto-tune could not score model configurations; "
-            "used fallback changepoint_prior_scale=0.05, interval_width=0.90, uncertainty_method=prophet."
+            f"used fallback changepoint_prior_scale=0.05, interval_width={target_coverage:.2f}, uncertainty_method=prophet. Coverage is unvalidated."
         )
         return TuningSelection(
             changepoint_prior_scale=DEFAULT_CHANGEPOINT_FALLBACK,
-            interval_width=DEFAULT_INTERVAL_WIDTH_FALLBACK,
+            interval_width=float(target_coverage),
             primary_metric="Joint model score",
             primary_score=None,
             note=note,
@@ -498,9 +577,15 @@ def select_joint_forecast_configuration(
             uncertainty_method="prophet",
         )
 
-    valid_rows["mape_norm"] = _balanced_error_score(pd.to_numeric(valid_rows["mape"], errors="coerce"))
-    valid_rows["mae_norm"] = _balanced_error_score(pd.to_numeric(valid_rows["mae"], errors="coerce"))
-    valid_rows["rmse_norm"] = _balanced_error_score(pd.to_numeric(valid_rows["rmse"], errors="coerce"))
+    valid_rows["mape_norm"] = _balanced_error_score(
+        pd.to_numeric(valid_rows["mape"], errors="coerce")
+    )
+    valid_rows["mae_norm"] = _balanced_error_score(
+        pd.to_numeric(valid_rows["mae"], errors="coerce")
+    )
+    valid_rows["rmse_norm"] = _balanced_error_score(
+        pd.to_numeric(valid_rows["rmse"], errors="coerce")
+    )
     valid_rows["coverage_gap_norm"] = _balanced_error_score(
         pd.to_numeric(valid_rows["coverage_gap"], errors="coerce").fillna(float("nan"))
     )
@@ -510,12 +595,15 @@ def select_joint_forecast_configuration(
         + valid_rows["rmse_norm"]
         + valid_rows["coverage_gap_norm"]
     ) / 4.0
-    valid_rows["tie_breaker_value"] = (
-        pd.to_numeric(valid_rows["coverage_gap"], errors="coerce") * 1000.0
-        + pd.to_numeric(valid_rows["rmse"], errors="coerce")
-    )
-    diagnostics_df.loc[valid_rows.index, "primary_score_value"] = valid_rows["primary_score_value"]
-    diagnostics_df.loc[valid_rows.index, "tie_breaker_value"] = valid_rows["tie_breaker_value"]
+    valid_rows["tie_breaker_value"] = pd.to_numeric(
+        valid_rows["coverage_gap"], errors="coerce"
+    ) * 1000.0 + pd.to_numeric(valid_rows["rmse"], errors="coerce")
+    diagnostics_df.loc[valid_rows.index, "primary_score_value"] = valid_rows[
+        "primary_score_value"
+    ]
+    diagnostics_df.loc[valid_rows.index, "tie_breaker_value"] = valid_rows[
+        "tie_breaker_value"
+    ]
 
     valid_rows["fallback_penalty"] = valid_rows["fallback_used"].astype(int)
     valid_rows["width_penalty"] = pd.to_numeric(
@@ -560,6 +648,7 @@ def select_uncertainty_configuration(
     forecast_periods: int,
     changepoint_prior_scale: float,
     target_coverage_candidates: Iterable[float] = DEFAULT_INTERVAL_WIDTH_CANDIDATES,
+    future_covariates=None,
 ) -> TuningSelection:
     rows: list[dict[str, object]] = []
     candidate_order = {"prophet": 0, "conformal": 1}
@@ -595,6 +684,11 @@ def select_uncertainty_configuration(
                     forecast_periods=forecast_periods,
                     changepoint_prior_scale=float(changepoint_prior_scale),
                     interval_width=candidate_target_coverage,
+                    **(
+                        {"future_covariates": future_covariates}
+                        if future_covariates is not None
+                        else {}
+                    ),
                 )
                 if method_name == "prophet":
                     _, cv_metrics = prophet_cross_validation_metrics(
@@ -614,6 +708,11 @@ def select_uncertainty_configuration(
                         forecast=forecast,
                         forecast_periods=forecast_periods,
                         target_coverage=candidate_target_coverage,
+                        **(
+                            {"future_covariates": future_covariates}
+                            if future_covariates is not None
+                            else {}
+                        ),
                     )
 
                 row["empirical_coverage"] = float(
@@ -623,7 +722,9 @@ def select_uncertainty_configuration(
                     interval_summary.get("coverage_gap", float("nan"))
                 )
                 row["interval_width_over_mean_actual"] = float(
-                    interval_summary.get("interval_width_over_mean_actual", float("nan"))
+                    interval_summary.get(
+                        "interval_width_over_mean_actual", float("nan")
+                    )
                 )
                 row["avg_interval_width"] = float(
                     interval_summary.get("avg_interval_width", float("nan"))

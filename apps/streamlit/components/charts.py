@@ -33,11 +33,7 @@ def forecast_line_chart(
     lower_col = None
     upper_col = None
     for lc, uc in [("yhat_lower_95", "yhat_upper_95"), ("yhat_lower", "yhat_upper")]:
-        if (
-            lc in df.columns
-            and uc in df.columns
-            and df[[lc, uc]].notna().any().any()
-        ):
+        if lc in df.columns and uc in df.columns and df[[lc, uc]].notna().any().any():
             lower_col, upper_col = lc, uc
             break
 
@@ -248,9 +244,12 @@ def fiscal_bar_chart(
         "Fiscal_Quarter",
         "Fiscal_Period_Label",
     }.issubset(chart_data.columns):
-        chart_data = chart_data.sort_values(
-            ["Fiscal_Year", "Fiscal_Quarter"]
-        ).reset_index(drop=True)
+        sort_column = (
+            "Fiscal_Month" if "Fiscal_Month" in chart_data else "Fiscal_Quarter"
+        )
+        chart_data = chart_data.sort_values(["Fiscal_Year", sort_column]).reset_index(
+            drop=True
+        )
         category_orders = {
             "Fiscal_Period_Label": chart_data["Fiscal_Period_Label"].tolist()
         }

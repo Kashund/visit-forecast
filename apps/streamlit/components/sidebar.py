@@ -4,21 +4,21 @@ import hashlib
 import pandas as pd
 import streamlit as st
 from io import StringIO
+from visit_forecast.io import read_data_file
 
 
 @st.cache_data
 def _read_uploaded(file) -> pd.DataFrame:
-    name = file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
+    return read_data_file(file)
 
 
 def _read_pasted_csv(text: str) -> pd.DataFrame:
     return pd.read_csv(StringIO(text))
 
 
-def _infer_timeframe_bounds(df_preview: pd.DataFrame | None) -> tuple[str | None, str | None]:
+def _infer_timeframe_bounds(
+    df_preview: pd.DataFrame | None,
+) -> tuple[str | None, str | None]:
     if df_preview is None or df_preview.empty or "Date" not in df_preview.columns:
         return None, None
 
@@ -40,15 +40,23 @@ def _source_signature(
 ) -> str | None:
     detected_start, detected_end = _infer_timeframe_bounds(df_preview)
     if source_mode == "Upload file" and uploaded is not None:
-        return (
-            f"upload:{getattr(uploaded, 'name', '')}:{detected_start}:{detected_end}:"
-            f"{len(df_preview) if df_preview is not None else 0}"
+        content = (
+            uploaded.getvalue()
+            if hasattr(uploaded, "getvalue")
+            else df_preview.to_csv(index=False).encode()
         )
+        digest = hashlib.sha256(content).hexdigest()
+        return f"upload:{getattr(uploaded, 'name', '')}:{digest}:{detected_start}:{detected_end}"
 
     if source_mode == "Paste values (CSV)" and pasted_text and pasted_text.strip():
         digest = hashlib.sha1(pasted_text.strip().encode("utf-8")).hexdigest()
         return f"paste:{digest}:{detected_start}:{detected_end}"
 
+    if source_mode == "Use shared dataset" and df_preview is not None:
+        return (
+            "shared:"
+            + hashlib.sha256(df_preview.to_csv(index=False).encode()).hexdigest()
+        )
     return None
 
 
@@ -96,7 +104,12 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     st.sidebar.markdown("**Data source**")
     source_mode = st.sidebar.radio(
         "Choose how to provide data",
-        ["Upload file", "Paste values (CSV)", "Use synthetic sample"],
+        [
+            "Upload file",
+            "Paste values (CSV)",
+            "Use synthetic sample",
+            "Use shared dataset",
+        ],
         index=0,
         key="source_mode",
         help="Upload Excel/CSV, paste raw CSV text, or use built-in synthetic data for testing.",
@@ -129,6 +142,14 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
         if pasted_text and pasted_text.strip():
             df_preview = _read_pasted_csv(pasted_text)
 
+    elif source_mode == "Use shared dataset":
+        shared = st.session_state.get("shared_dataset")
+        if shared is not None:
+            df_preview = shared.copy()
+        else:
+            st.sidebar.info(
+                "No shared dataset yet. Upload data on Data Check or run a forecast first."
+            )
     else:
         st.sidebar.caption(
             "Synthetic data includes: Cardiology, Oncology, Neurology (monthly)."
@@ -172,81 +193,9 @@ def sidebar_controls() -> tuple[dict, pd.DataFrame | None]:
     st.sidebar.divider()
     st.sidebar.markdown("**Capacity adjustment phases**")
 
-    capacity_phases = []
-    default_end = min(12, forecast_periods)
-    default_month_range = (1, default_end)
+    from components.phases import phase_editor
 
-    # If the forecast horizon shrank after phase windows were set, Streamlit
-    # would otherwise silently reset out-of-range sliders to their defaults,
-    # quietly moving an enabled adjustment onto the wrong months. Clamp the
-    # stored values to the new horizon instead and tell the user.
-    clamped_phase_numbers: list[int] = []
-    for phase_number in range(1, 5):
-        range_key = f"phase_{phase_number}_between"
-        stored_range = st.session_state.get(range_key)
-        if stored_range is None:
-            continue
-        stored_start, stored_end = int(stored_range[0]), int(stored_range[1])
-        clamped_start = max(1, min(stored_start, forecast_periods))
-        clamped_end = max(clamped_start, min(stored_end, forecast_periods))
-        if (clamped_start, clamped_end) != (stored_start, stored_end):
-            st.session_state[range_key] = (clamped_start, clamped_end)
-            if bool(st.session_state.get(f"phase_{phase_number}_enabled", False)):
-                clamped_phase_numbers.append(phase_number)
-    if clamped_phase_numbers:
-        clamped_list = ", ".join(str(n) for n in clamped_phase_numbers)
-        st.sidebar.warning(
-            f"Phase month range(s) for phase(s) {clamped_list} were clamped to "
-            f"the new {forecast_periods}-month horizon. Review them before running."
-        )
-
-    for phase_number in range(1, 5):
-        with st.sidebar.expander(f"Phase {phase_number}", expanded=False):
-            phase_enabled = st.checkbox(
-                "Enabled",
-                value=False,
-                key=f"phase_{phase_number}_enabled",
-            )
-
-            phase_mode_label = st.selectbox(
-                "Mode",
-                ["Capacity loss", "Capacity add"],
-                index=0,
-                key=f"phase_{phase_number}_mode",
-                help="Loss reduces forecasted visits; Add increases forecasted visits.",
-            )
-            phase_mode = "loss" if phase_mode_label == "Capacity loss" else "add"
-
-            phase_percent = float(
-                st.slider(
-                    "Percent (%)",
-                    0,
-                    50,
-                    0,
-                    key=f"phase_{phase_number}_percent",
-                    help="Percent magnitude applied in the selected month range.",
-                )
-            )
-
-            phase_month_range = st.slider(
-                "Apply between forecast months",
-                min_value=1,
-                max_value=forecast_periods,
-                value=default_month_range,
-                step=1,
-                key=f"phase_{phase_number}_between",
-                help="1 = first forecasted future month. Applies within this inclusive range.",
-            )
-
-            capacity_phases.append(
-                {
-                    "enabled": phase_enabled,
-                    "mode": phase_mode,
-                    "percent": phase_percent,
-                    "start_month": int(phase_month_range[0]),
-                    "end_month": int(phase_month_range[1]),
-                }
-            )
+    capacity_phases = phase_editor("phase", forecast_periods, st.sidebar)
 
     st.sidebar.divider()
     st.sidebar.markdown("**Forecast model**")
